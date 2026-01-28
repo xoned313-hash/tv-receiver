@@ -1,38 +1,56 @@
-const express = require("express");
+import express from "express";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 const app = express();
-
-// IMPORTANT: DigitalOcean will send requests to your app.
-// We accept JSON and also raw text (some webhooks send non-JSON).
 app.use(express.json({ limit: "1mb" }));
-app.use(express.text({ type: "*/*", limit: "1mb" }));
 
-// Health check (used by platforms / humans)
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("sslmode=require")
+    ? { rejectUnauthorized: false }
+    : undefined,
 });
 
-// Main webhook endpoint
-app.post("/webhook", (req, res) => {
-  // Optional secret check (recommended once TradingView is wired)
-  const expected = process.env.WEBHOOK_SECRET;
-  if (expected) {
-    const got = req.header("x-webhook-secret");
-    if (!got || got !== expected) {
-      return res.status(401).send("Unauthorized");
-    }
+/**
+ * HEALTH CHECK
+ */
+app.get("/healthz", async (req, res) => {
+  try {
+    const r = await pool.query("select now()");
+    res.json({ ok: true, db_ok: true, now: r.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * WEBHOOK RECEIVER (RAW)
+ */
+app.post("/webhook", async (req, res) => {
+  const secret = req.query.secret;
+  if (!secret || secret !== process.env.WEBHOOK_SECRET) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
   }
 
-  // Log the payload (safe for now; later we’ll sanitize)
-  const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-  console.log("WEBHOOK_RECEIVED:", body);
+  try {
+    await pool.query(
+      `
+      insert into raw_events (received_at, payload)
+      values (now(), $1)
+      `,
+      [req.body]
+    );
 
-  // Tell TradingView “success”
-  res.status(200).json({ ok: true });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "db_insert_failed" });
+  }
 });
 
-// DigitalOcean (and most platforms) provide PORT
-const port = Number(process.env.PORT) || 8080;
+const port = process.env.PORT || 8080;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Listening on port ${port}`);
+  console.log("listening on", port);
 });
