@@ -6,15 +6,18 @@ const { Pool } = pkg;
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// Postgres connection
+// NOTE: The ssl: { rejectUnauthorized: false } setting fixes the
+// "self-signed certificate in certificate chain" error commonly seen
+// with managed Postgres providers.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("sslmode=require")
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: { rejectUnauthorized: false },
 });
 
 /**
  * HEALTH CHECK
+ * Confirms the server is up and can reach Postgres.
  */
 app.get("/healthz", async (req, res) => {
   try {
@@ -27,6 +30,7 @@ app.get("/healthz", async (req, res) => {
 
 /**
  * WEBHOOK RECEIVER (RAW)
+ * Stores every incoming request body into raw_events.payload.
  */
 app.post("/webhook", async (req, res) => {
   const secret = req.query.secret;
