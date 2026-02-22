@@ -5,51 +5,49 @@ const { Pool } = pg;
 
 const app = express();
 
-// TradingView often sends text/plain. Accept everything as text.
+// TradingView often sends text/plain; accept all as text and parse ourselves.
 app.use(express.text({ type: "*/*", limit: "2mb" }));
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
-
 const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || "").trim();
 const DATABASE_URL_RAW = (process.env.DATABASE_URL || "").trim();
 
-// DigitalOcean DB component commonly provides CA cert via ${<db>.CA_CERT}
+// DO DB component commonly provides CA cert via ${<db-component>.CA_CERT}
 const CA_CERT = (process.env.CA_CERT || process.env.DATABASE_CA_CERT || "").trim();
 
-// Set PGSSL_INSECURE=1 ONLY if you want a temporary insecure bypass.
+// Set PGSSL_INSECURE=1 ONLY for a temporary debug bypass.
 const PGSSL_INSECURE = (process.env.PGSSL_INSECURE || "").trim() === "1";
 
 function scrubDbUrl(url) {
   if (!url) return "";
   try {
     const u = new URL(url);
-    // IMPORTANT: node-postgres can override ssl config when sslmode is present.
+    // Ensure our explicit ssl config is used (avoid sslmode overriding behavior).
     u.searchParams.delete("sslmode");
     return u.toString();
   } catch {
-    // Fallback: strip sslmode manually
     return url.replace(/[?&]sslmode=[^&]+/i, "");
   }
 }
 
 function pgSslConfig() {
   const pgsslmode = (process.env.PGSSLMODE || "").toLowerCase();
-
   if (pgsslmode === "disable") return false;
 
-  // Recommended secure path: verify using CA cert
+  // Secure path: verify TLS with CA cert.
   if (CA_CERT) {
-    retu [oai_citation:22‡GITHUB REPOSITORY .txt](sediment://file_00000000ddb471f887bca608eeb8e083)horized: true,
+    return {
+      rejectUnauthorized: true,
       ca: CA_CERT.replace(/\\n/g, "\n"),
     };
   }
 
-  // Optional insecure bypass (only if you explicitly set it)
+  // Optional insecure bypass (only if you explicitly set it).
   if (PGSSL_INSECURE) {
     return { rejectUnauthorized: false };
   }
 
-  // Fail closed by default (forces you to set CA_CERT correctly)
+  // Fail closed by default (forces proper CA configuration).
   return { rejectUnauthorized: true };
 }
 
@@ -118,11 +116,9 @@ function getSourceIp(req) {
   return req.socket?.remoteAddress || null;
 }
 
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
+app.get("/", (req, res) => res.status(200).send("ok"));
 
-// Health endpoint: this is what you open in the browser.
+// Helpful “alive” signal + DB connectivity proof.
 app.get("/healthz", async (req, res) => {
   const now = new Date().toISOString();
   try {
@@ -158,7 +154,7 @@ async function handleWebhook(req, res) {
 
   const payload = parsePayload(req);
 
-  // B1M_TRUTH rule: do NOT put secrets in JSON body; secret must be URL query param.
+  // Contract rule: secret must be in query string, not in JSON body.
   if (
     payload &&
     typeof payload === "object" &&
@@ -191,13 +187,13 @@ async function handleWebhook(req, res) {
   }
 }
 
-// TradingView endpoint (required by B1M_TRUTH)
+// TradingView endpoint (POST).
 app.post("/tv", handleWebhook);
 
-// Optional generic endpoint
+// Optional generic endpoint.
 app.post("/webhook", handleWebhook);
 
-// Export so you can SEE the rows landed
+// Export so you can verify rows landed.
 app.get("/export/raw_events", async (req, res) => {
   if (!requireSecret(req, res)) return;
 
