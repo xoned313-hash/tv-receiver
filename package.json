@@ -11,3 +11,9 @@
     "pg": "^8.11.5"
   }
 }
+{
+  "scripts": {
+    "start": "node index.js",
+    "materializer": "node materializer.js"
+  }
+}
