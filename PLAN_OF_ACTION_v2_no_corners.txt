@@ -1,0 +1,815 @@
+PLAN OF ACTION — tv-receiver + Postgres + MCP + GitHub (No Corners)
+Version: 2.0
+Last updated: 2026-02-21
+Timezone: America/Detroit (ET)
+
+Goal
+Bring the telemetry ledger system to an “audit-grade running” state:
+  • TradingView (B1M) emits JSON bundles
+  • Receiver ingests securely and idempotently into Postgres RAW spine
+  • MCP server provides read-only DB visibility inside ChatGPT
+  • GitHub repo is the canonical source of truth (contract + runbooks + migrations)
+  • QA gates + replay are planned and staged (no silent gaps, no shortcuts)
+
+Found issues in the current project files (must fix first)
+  1) A real-looking webhook secret appears in PLAN OF ACTION.txt (treat as compromised; rotate).
+  2) Current index.js disables TLS verification globally (NODE_TLS_REJECT_UNAUTHORIZED=0) — forbidden in prod.
+  3) Current receiver only listens on /webhook, but B1M expects /tv.
+  4) Plan’s “Receiver v2” stores raw IP and user-agent, but contract requires ip_hash only (privacy).
+  5) Contract common fields list includes ip_hash etc, but the DDL in v2.3 does not — must reconcile (done in Contract v2.4).
+
+PHASE 0 — Governance + repo hygiene (same day)
+0.1 Rotate secrets (immediately)
+  • Set a NEW WEBHOOK_SECRET in DigitalOcean App Platform env vars.
+  • Update TradingView webhook URL to the new secret.
+  • Remove any secrets from docs, screenshots, commits, chats.
+
+Acceptance:
+  ✓ Old secret no longer accepted (401).
+  ✓ New secret accepted (200) with test POST.
+
+0.2 Create canonical docs in repo
+  • Add these files to the repo root (or /docs):
+    - CONTRACT_P1.2_v2.4_integrated.txt
+    - PROJECT_INSTRUCTIONS_tv-receiver.txt
+    - PLAN_OF_ACTION_v2_no_corners.txt
+  • Update README.md with:
+    - what services exist
+    - how to deploy
+    - where the contract lives
+    - how to run acceptance tests
+
+Acceptance:
+  ✓ A new engineer could deploy using only README + Plan.
+
+0.3 Add .env.example (no secrets)
+  Include names only:
+    DATABASE_URL=
+    DATABASE_CA_CERT=
+    WEBHOOK_SECRET=
+    NODE_ENV=production
+    RECEIVER_ENV=prod|staging|dev
+
+Acceptance:
+  ✓ No secrets committed; .env remains ignored.
+
+PHASE 1 — Postgres: roles + migrations (same day)
+1.1 Create DB roles (least privilege)
+  • Create:
+    - tv_ingress_writer: INSERT/UPDATE only on runs + raw_events (no DROP/ALTER)
+    - tv_mcp_reader: SELECT only
+  • Ensure DATABASE_URL used by receiver is tv_ingress_writer.
+  • Ensure DATABASE_URL used by MCP is tv_mcp_reader.
+
+Acceptance:
+  ✓ Writer can INSERT but cannot DROP tables.
+  ✓ Reader can SELECT but cannot INSERT.
+
+1.2 Apply migration SQL (Contract Appendix A)
+  • Run the migration SQL once using an admin DB user.
+  • Verify tables and indexes exist: runs, raw_events, enums.
+
+Acceptance (psql / MCP):
+  ✓ list_tables shows runs/raw_events.
+  ✓ describe_table raw_events shows required columns.
+  ✓ unique index on (run_id, seq) exists.
+
+PHASE 2 — Receiver v3 (contract-aligned ingress) (same day)
+2.1 Replace index.js with Receiver v3
+Receiver v3 MUST:
+  • Verify TLS using DATABASE_CA_CERT (rejectUnauthorized=true).
+  • Serve:
+    - POST /tv
+    - POST /webhook (alias)
+    - GET /healthz
+  • Enforce secret in query string (?secret=...); reject if missing/mismatch.
+  • Support both:
+    - BUNDLE_JSON payloads containing records[]
+    - single-record JSON
+  • For each logical record:
+    - redact sensitive keys
+    - compute payload_sha256 + payload_size_bytes
+    - compute ip_hash + user_agent_hash
+    - compute day_id_utc/day_id_local + session_id (default session_id = UTC_DAY_YYYY-MM-DD)
+    - compute missing_required_count + unknown_keys_count and schema_match_ok
+    - upsert into runs
+    - insert into raw_events with ON CONFLICT (uid) DO NOTHING
+  • On auth failure or parse failure:
+    - persist INGRESS_REJECT or ERROR record (no silent drops)
+
+Acceptance:
+  ✓ /healthz returns db_ok=true and raw_events count.
+  ✓ A test POST to /tv inserts at least 1 row.
+  ✓ Duplicate POST does not create duplicate rows (idempotent).
+  ✓ Auth failure produces an INGRESS_REJECT row (not silent 401 only).
+
+2.2 Configure receiver environment variables in DO
+  Required:
+    DATABASE_URL (writer role)
+    DATABASE_CA_CERT (full PEM text)
+    WEBHOOK_SECRET
+    RECEIVER_ENV (prod/staging/dev)
+  Forbidden:
+    NODE_TLS_REJECT_UNAUTHORIZED=0
+
+Acceptance:
+  ✓ TLS verification enabled (no insecure bypass).
+  ✓ Receiver can insert into DB without SSL errors.
+
+PHASE 3 — TradingView producer setup (same day)
+3.1 Import B1M_TRUTH script (Pine v6)
+  • Verify it compiles.
+  • Keep emitMode = BUNDLE_JSON unless you have a strong reason otherwise.
+
+3.2 Create TradingView alert
+  • Condition: Any alert() function call
+  • Webhook URL: https://<RECEIVER_HOST>/tv?secret=<WEBHOOK_SECRET>
+  • Message: {message} exactly
+  • Frequency: Once Per Bar Close
+
+Acceptance:
+  ✓ raw_events grows over time with BAR records.
+  ✓ CONFIG appears at start and on change/beacon (as configured).
+
+PHASE 4 — MCP DB server (read-only visibility in ChatGPT) (1–2 days)
+4.1 Create MCP server repo/service
+  • Deploy the provided FastMCP + psycopg3 server as a separate service.
+  • Use DATABASE_URL pointing to tv_mcp_reader (read-only).
+
+4.2 Authentication (no corners)
+  • Preferred: configure MCP app in ChatGPT with an API key or OAuth (depending on what the UI supports).
+  • If the UI does not support API keys and OAuth is not feasible immediately:
+      - treat MCP as DEV-only
+      - restrict network access (allowlist / private ingress)
+      - keep toolset minimal
+      - document the exception in CHANGE_CONTROL
+
+Acceptance:
+  ✓ db_health returns ok=true.
+  ✓ list_tables works.
+  ✓ run_select_sql rejects non-SELECT statements.
+  ✓ MCP cannot write even if compromised (read-only DB role).
+
+PHASE 5 — Connect tools in ChatGPT (same day as deploy)
+5.1 GitHub app
+  • Enable GitHub app in ChatGPT and authorize the tv-receiver repo (+ MCP repo if separate).
+
+Acceptance:
+  ✓ In ChatGPT, you can ask: “Search the repo for raw_events” and it returns matching files.
+
+5.2 MCP app (Developer Mode)
+  • Create an app in ChatGPT pointing to https://<MCP_HOST>/mcp (or equivalent endpoint).
+
+Acceptance:
+  ✓ In ChatGPT, you can run db_health/list_tables/describe_table/tail_raw_events.
+
+PHASE 6 — QA gates + materializer (next milestone; do not skip before automation)
+6.1 Add a deterministic materializer service
+  • Reads raw_events, validates CONFIG coverage, and writes typed tables (bars, evals, etc).
+  • Produces QA_AUDIT and quarantine flags when invariants fail.
+
+6.2 Add replay + conformance reports
+  • Implement replay from raw_events to derived tables with mismatch report artifacts.
+
+Acceptance:
+  ✓ A replay run produces identical derived tables (or explicit bounded diffs).
+  ✓ A conformance report exists for each export.
+
+PHASE 7 — Automation ladder (only after PHASE 6 passes)
+7.1 Add scheduled reports (hourly/daily)
+  • Reports must include QA summary + data freshness + drift warnings.
+  • No trade execution automation without explicit human-in-loop gates + kill-switch.
+
+Acceptance:
+  ✓ Scheduled job produces report artifacts and never silently fails.
+  ✓ If QA gate fails, report is marked PROVISIONAL/BLOCKED and trading outputs halt.
+
+END STATE — Definition of “Up and Running”
+The system is “up and running” only when:
+  • Receiver is secure (TLS verified, secrets handled correctly, no raw IP storage).
+  • RAW spine is populated and idempotent.
+  • MCP visibility is live and read-only.
+  • GitHub is connected and holds canonical docs/migrations.
+  • QA + replay roadmap exists and is being executed before automation expands.
+
+
+APPENDIX A — Receiver v3 index.js (full replacement)
+
+// Receiver v3 — contract-aligned TV ingress (no corners)
+// - TLS verified via DATABASE_CA_CERT (required)
+// - /tv + /webhook
+// - BUNDLE_JSON (records[]) + single-record JSON
+// - Writes to runs + raw_events (append-only, idempotent)
+// - Stores ip_hash/user_agent_hash (no raw IP persisted)
+// - Redacts token-like fields before hashing/storage
+
+import express from "express";
+import pg from "pg";
+import crypto from "crypto";
+
+const { Pool } = pg;
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+const PORT = parseInt(process.env.PORT || "8080", 10);
+
+const RECEIVER_ENV = (process.env.RECEIVER_ENV || "prod").trim(); // prod|staging|dev
+const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || "").trim();
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+const DATABASE_CA_CERT = (process.env.DATABASE_CA_CERT || "").trim();
+
+if (!DATABASE_URL) {
+  console.error("FATAL: DATABASE_URL is not set");
+  process.exit(1);
+}
+if (!WEBHOOK_SECRET) {
+  console.error("FATAL: WEBHOOK_SECRET is not set (fail-closed)");
+  process.exit(1);
+}
+if (!DATABASE_CA_CERT) {
+  console.error("FATAL: DATABASE_CA_CERT is not set (TLS verification required; no corners)");
+  process.exit(1);
+}
+
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+function stableStringify(x) {
+  // Deterministic JSON stringify (sorted object keys).
+  if (x === null || x === undefined) return "null";
+  if (typeof x !== "object") return JSON.stringify(x);
+  if (Array.isArray(x)) return "[" + x.map(stableStringify).join(",") + "]";
+  const keys = Object.keys(x).sort();
+  const parts = [];
+  for (const k of keys) {
+    parts.push(JSON.stringify(k) + ":" + stableStringify(x[k]));
+  }
+  return "{" + parts.join(",") + "}";
+}
+
+const REDACT_KEYS = new Set([
+  "secret",
+  "webhook_secret",
+  "webhooksecret",
+  "token",
+  "authorization",
+  "api_key",
+  "apikey",
+  "password",
+]);
+
+function redactDeep(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) return obj.map(redactDeep);
+  if (typeof obj !== "object") return obj;
+
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const lk = String(k).toLowerCase();
+    if (REDACT_KEYS.has(lk)) {
+      out[k] = "[REDACTED]";
+    } else {
+      out[k] = redactDeep(v);
+    }
+  }
+  return out;
+}
+
+function requireSecret(req, res) {
+  const provided = String(req.query.secret || "");
+  if (provided !== WEBHOOK_SECRET) {
+    res.status(401).json({ ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+function getClientIp(req) {
+  const xf = (req.headers["x-forwarded-for"] || "").toString();
+  const ip = xf.split(",")[0].trim() || req.socket?.remoteAddress || "";
+  return ip;
+}
+
+function getUserAgent(req) {
+  return (req.headers["user-agent"] || "").toString();
+}
+
+function formatDayIdUTC(ms) {
+  const d = new Date(ms);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function formatDayIdLocal(ms, timeZone) {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    // en-CA yields YYYY-MM-DD format
+    return fmt.format(new Date(ms));
+  } catch {
+    return formatDayIdUTC(ms);
+  }
+}
+
+function sessionIdFromUTC(ms) {
+  return "UTC_DAY_" + formatDayIdUTC(ms);
+}
+
+// Minimal required keys per row_type for schema_match_ok.
+// NOTE: Full schema registry enforcement is a later milestone; this is a strict “minimum viable gate”.
+const REQUIRED_KEYS_COMMON = [
+  "row_type",
+  "schema_version",
+  "schema_registry_hash",
+  "producer",
+  "uid",
+  "seq",
+  "run_id",
+  "cfg_sig",
+  "t_subject_ms",
+  "t_event_ms",
+  "env",
+  "deployment_id",
+  "exchange",
+  "symbol",
+  "tickerid",
+  "instrument_type",
+  "tf",
+  "tf_sec",
+];
+
+function requiredKeysForRowType(rowType) {
+  // Extend row-type specific required keys here if needed.
+  if (rowType === "EVAL") return REQUIRED_KEYS_COMMON.concat(["parent_uid"]);
+  return REQUIRED_KEYS_COMMON;
+}
+
+function missingRequiredCount(rec, rowType) {
+  const req = requiredKeysForRowType(rowType);
+  let missing = 0;
+  for (const k of req) {
+    if (!(k in rec) || rec[k] === null || rec[k] === undefined || rec[k] === "") missing += 1;
+  }
+  return missing;
+}
+
+function producerIdFrom(rec) {
+  const p = String(rec.producer || "").toUpperCase().trim();
+  if (p === "A1M") return "A1M";
+  if (p === "B1M") return "B1M";
+  return "INGRESS";
+}
+
+function envFrom(rec) {
+  const e = String(rec.env || "").toLowerCase().trim();
+  if (e === "prod" || e === "staging" || e === "dev") return e;
+  return RECEIVER_ENV === "staging" ? "staging" : (RECEIVER_ENV === "dev" ? "dev" : "prod");
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: true,
+    ca: DATABASE_CA_CERT.replace(/\\n/g, "\n"),
+  },
+  max: 5,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+});
+
+async function dbSelfTest() {
+  await pool.query("select 1 as ok");
+  // Ensure core tables exist (migrations must be applied out-of-band)
+  await pool.query("select 1 from runs limit 1");
+  await pool.query("select 1 from raw_events limit 1");
+}
+
+async function upsertRun({
+  run_id,
+  env,
+  deployment_id,
+  producer_id,
+  timezone,
+  started_at_ms,
+  started_at_iso,
+  cfg_sig,
+  created_at_ms,
+}) {
+  await pool.query(
+    `
+    insert into runs (
+      run_id, env, deployment_id, producer_id, timezone,
+      started_at_ms, started_at_iso,
+      first_cfg_sig, last_cfg_sig,
+      created_at_ms
+    )
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)
+    on conflict (run_id) do update set
+      last_cfg_sig = excluded.last_cfg_sig,
+      -- keep earliest started_at_ms/iso
+      started_at_ms = least(runs.started_at_ms, excluded.started_at_ms),
+      started_at_iso = case
+        when runs.started_at_ms <= excluded.started_at_ms then runs.started_at_iso
+        else excluded.started_at_iso
+      end
+    `,
+    [
+      run_id,
+      env,
+      deployment_id,
+      producer_id,
+      timezone,
+      started_at_ms,
+      started_at_iso,
+      cfg_sig || null,
+      created_at_ms,
+    ]
+  );
+}
+
+async function insertRawEvent(row) {
+  await pool.query(
+    `
+    insert into raw_events (
+      uid, row_type, parent_uid,
+      run_id, cfg_sig,
+      schema_version, schema_registry_hash,
+      producer_id, deployment_id, env,
+      exchange, symbol, tickerid, instrument_type, tf, tf_sec, seq,
+      t_subject_ms, t_event_ms, t_received_ms, latency_ms,
+      t_subject_iso, t_event_iso, timezone, day_id_utc, day_id_local, session_id,
+      auth_ok, request_id, ip_hash, user_agent_hash,
+      parse_ok, schema_match_ok, unknown_keys_count, missing_required_count,
+      script_sha,
+      payload_sha256, payload_size_bytes, payload_raw_redacted,
+      created_at_ms
+    )
+    values (
+      $1,$2,$3,
+      $4,$5,
+      $6,$7,
+      $8,$9,$10,
+      $11,$12,$13,$14,$15,$16,$17,
+      $18,$19,$20,$21,
+      $22,$23,$24,$25,$26,$27,
+      $28,$29,$30,$31,
+      $32,$33,$34,$35,
+      $36,
+      $37,$38,$39,
+      $40
+    )
+    on conflict (uid) do nothing
+    `,
+    [
+      row.uid, row.row_type, row.parent_uid,
+      row.run_id, row.cfg_sig,
+      row.schema_version, row.schema_registry_hash,
+      row.producer_id, row.deployment_id, row.env,
+      row.exchange, row.symbol, row.tickerid, row.instrument_type, row.tf, row.tf_sec, row.seq,
+      row.t_subject_ms, row.t_event_ms, row.t_received_ms, row.latency_ms,
+      row.t_subject_iso, row.t_event_iso, row.timezone, row.day_id_utc, row.day_id_local, row.session_id,
+      row.auth_ok, row.request_id, row.ip_hash, row.user_agent_hash,
+      row.parse_ok, row.schema_match_ok, row.unknown_keys_count, row.missing_required_count,
+      row.script_sha,
+      row.payload_sha256, row.payload_size_bytes, row.payload_raw_redacted,
+      row.created_at_ms,
+    ]
+  );
+}
+
+function buildIngressErrorRecord({ request_id, ip_hash, user_agent_hash, t_received_ms, reason, raw }) {
+  const z64 = "0".repeat(64);
+  const run_id = "RUN_UNKNOWN";
+  const cfg_sig = "CFG_UNKNOWN";
+  const uid = `ERROR|${request_id || t_received_ms}`;
+  const t_subject_ms = t_received_ms;
+  const t_event_ms = t_received_ms;
+
+  const timezone = "UTC";
+  const day_id_utc = formatDayIdUTC(t_subject_ms);
+  const day_id_local = day_id_utc;
+  const session_id = sessionIdFromUTC(t_subject_ms);
+
+  const payload_redacted = redactDeep({
+    error_reason: reason,
+    raw_payload: raw,
+  });
+
+  const payload_str = stableStringify(payload_redacted);
+  return {
+    uid,
+    row_type: "ERROR",
+    parent_uid: null,
+    run_id,
+    cfg_sig,
+    schema_version: 0,
+    schema_registry_hash: z64,
+    producer_id: "INGRESS",
+    deployment_id: "INGRESS",
+    env: envFrom({ env: RECEIVER_ENV }),
+    exchange: "UNKNOWN",
+    symbol: "UNKNOWN",
+    tickerid: "UNKNOWN",
+    instrument_type: "UNKNOWN",
+    tf: "UNKNOWN",
+    tf_sec: 0,
+    seq: 0,
+    t_subject_ms,
+    t_event_ms,
+    t_received_ms,
+    latency_ms: 0,
+    t_subject_iso: new Date(t_subject_ms).toISOString(),
+    t_event_iso: new Date(t_event_ms).toISOString(),
+    timezone,
+    day_id_utc,
+    day_id_local,
+    session_id,
+    auth_ok: false,
+    request_id: request_id || null,
+    ip_hash,
+    user_agent_hash,
+    parse_ok: false,
+    schema_match_ok: false,
+    unknown_keys_count: 0,
+    missing_required_count: 0,
+    script_sha: null,
+    payload_sha256: sha256Hex(payload_str),
+    payload_size_bytes: Buffer.byteLength(payload_str, "utf8"),
+    payload_raw_redacted: payload_redacted,
+    created_at_ms: t_received_ms,
+  };
+}
+
+async function ingestLogicalRecord({ rec, auth_ok, request_id, ip_hash, user_agent_hash, t_received_ms }) {
+  const row_type = String(rec.row_type || "").trim();
+  const env = envFrom(rec);
+  const producer_id = producerIdFrom(rec);
+
+  const run_id = String(rec.run_id || "RUN_UNKNOWN").trim() || "RUN_UNKNOWN";
+  const cfg_sig = String(rec.cfg_sig || "CFG_UNKNOWN").trim() || "CFG_UNKNOWN";
+
+  const deployment_id = String(rec.deployment_id || "UNKNOWN").trim() || "UNKNOWN";
+  const exchange = String(rec.exchange || "UNKNOWN").trim() || "UNKNOWN";
+  const symbol = String(rec.symbol || "UNKNOWN").trim() || "UNKNOWN";
+  const tickerid = String(rec.tickerid || "UNKNOWN").trim() || "UNKNOWN";
+  const instrument_type = String(rec.instrument_type || "UNKNOWN").trim() || "UNKNOWN";
+  const tf = String(rec.tf || "UNKNOWN").trim() || "UNKNOWN";
+  const tf_sec = Number.isFinite(rec.tf_sec) ? Number(rec.tf_sec) : parseInt(String(rec.tf_sec || "0"), 10) || 0;
+  const seq = Number.isFinite(rec.seq) ? Number(rec.seq) : parseInt(String(rec.seq || "0"), 10) || 0;
+
+  const uid = String(rec.uid || "").trim();
+  if (!uid) {
+    // No corners: uid is required. Store as ERROR record instead.
+    const err = buildIngressErrorRecord({
+      request_id,
+      ip_hash,
+      user_agent_hash,
+      t_received_ms,
+      reason: "missing_uid",
+      raw: rec,
+    });
+    await upsertRun({
+      run_id: err.run_id,
+      env: err.env,
+      deployment_id: err.deployment_id,
+      producer_id: err.producer_id,
+      timezone: err.timezone,
+      started_at_ms: err.t_subject_ms,
+      started_at_iso: err.t_subject_iso,
+      cfg_sig: err.cfg_sig,
+      created_at_ms: err.created_at_ms,
+    });
+    await insertRawEvent(err);
+    return;
+  }
+
+  // Redact before hashing/storing
+  const rec_redacted = redactDeep(rec);
+
+  const payload_str = stableStringify(rec_redacted);
+  const payload_sha256 = sha256Hex(payload_str);
+  const payload_size_bytes = Buffer.byteLength(payload_str, "utf8");
+
+  const schema_version = Number.isFinite(rec.schema_version) ? Number(rec.schema_version) : parseInt(String(rec.schema_version || "0"), 10) || 0;
+  const schema_registry_hash = String(rec.schema_registry_hash || "0".repeat(64)).trim() || "0".repeat(64);
+
+  const t_subject_ms = Number.isFinite(rec.t_subject_ms) ? Number(rec.t_subject_ms) : parseInt(String(rec.t_subject_ms || "0"), 10) || 0;
+  const t_event_ms = Number.isFinite(rec.t_event_ms) ? Number(rec.t_event_ms) : parseInt(String(rec.t_event_ms || "0"), 10) || 0;
+
+  const latency_ms = t_received_ms - t_event_ms;
+
+  const timezone = String(rec.timezone_id || rec.timezone || "UTC").trim() || "UTC";
+  const day_id_utc = formatDayIdUTC(t_subject_ms || t_received_ms);
+  const day_id_local = formatDayIdLocal(t_subject_ms || t_received_ms, timezone);
+  const session_id = sessionIdFromUTC(t_subject_ms || t_received_ms);
+
+  const missing_required_count = missingRequiredCount(rec, row_type);
+  const schema_match_ok = missing_required_count === 0;
+
+  // NOTE: until schema registry enforcement is implemented, unknown_keys_count is 0 by definition.
+  const unknown_keys_count = 0;
+
+  // auth_ok=false must force row_type to INGRESS_REJECT/ERROR (contract)
+  const final_row_type = auth_ok ? row_type : "INGRESS_REJECT";
+
+  // Upsert run first (FK)
+  await upsertRun({
+    run_id,
+    env,
+    deployment_id,
+    producer_id,
+    timezone,
+    started_at_ms: t_subject_ms || t_received_ms,
+    started_at_iso: new Date(t_subject_ms || t_received_ms).toISOString(),
+    cfg_sig,
+    created_at_ms: t_received_ms,
+  });
+
+  const row = {
+    uid,
+    row_type: final_row_type,
+    parent_uid: rec.parent_uid ? String(rec.parent_uid) : null,
+    run_id,
+    cfg_sig,
+    schema_version,
+    schema_registry_hash,
+    producer_id,
+    deployment_id,
+    env,
+    exchange,
+    symbol,
+    tickerid,
+    instrument_type,
+    tf,
+    tf_sec,
+    seq,
+    t_subject_ms: t_subject_ms || t_received_ms,
+    t_event_ms: t_event_ms || t_received_ms,
+    t_received_ms,
+    latency_ms,
+    t_subject_iso: new Date(t_subject_ms || t_received_ms).toISOString(),
+    t_event_iso: new Date(t_event_ms || t_received_ms).toISOString(),
+    timezone,
+    day_id_utc,
+    day_id_local,
+    session_id,
+    auth_ok: Boolean(auth_ok),
+    request_id,
+    ip_hash,
+    user_agent_hash,
+    parse_ok: true,
+    schema_match_ok,
+    unknown_keys_count,
+    missing_required_count,
+    script_sha: rec.script_sha ? String(rec.script_sha) : null,
+    payload_sha256,
+    payload_size_bytes,
+    payload_raw_redacted: rec_redacted,
+    created_at_ms: t_received_ms,
+  };
+
+  await insertRawEvent(row);
+}
+
+async function handleWebhook(req, res) {
+  const t_received_ms = Date.now();
+  const request_id = crypto.randomUUID();
+
+  const ip_hash = sha256Hex(getClientIp(req) || "");
+  const user_agent_hash = sha256Hex(getUserAgent(req) || "");
+
+  const auth_ok = String(req.query.secret || "") === WEBHOOK_SECRET;
+
+  // Parse payload
+  const body = req.body;
+  if (!body || typeof body !== "object") {
+    // Persist ERROR record (no silent drops)
+    const err = buildIngressErrorRecord({
+      request_id,
+      ip_hash,
+      user_agent_hash,
+      t_received_ms,
+      reason: "non_json_body",
+      raw: body,
+    });
+    await upsertRun({
+      run_id: err.run_id,
+      env: err.env,
+      deployment_id: err.deployment_id,
+      producer_id: err.producer_id,
+      timezone: err.timezone,
+      started_at_ms: err.t_subject_ms,
+      started_at_iso: err.t_subject_iso,
+      cfg_sig: err.cfg_sig,
+      created_at_ms: err.created_at_ms,
+    });
+    await insertRawEvent(err);
+    return res.status(400).json({ ok: false, error: "invalid_json" });
+  }
+
+  // Enforce “no secrets in body” rule (hard)
+  const bodyStr = JSON.stringify(body);
+  if (/\"secret\"\\s*:/.test(bodyStr) || /\"webhook_secret\"\\s*:/.test(bodyStr) || /\"token\"\\s*:/.test(bodyStr)) {
+    const err = buildIngressErrorRecord({
+      request_id,
+      ip_hash,
+      user_agent_hash,
+      t_received_ms,
+      reason: "secret_in_body_forbidden",
+      raw: "[REDACTED_AT_INGRESS]",
+    });
+    await upsertRun({
+      run_id: err.run_id,
+      env: err.env,
+      deployment_id: err.deployment_id,
+      producer_id: err.producer_id,
+      timezone: err.timezone,
+      started_at_ms: err.t_subject_ms,
+      started_at_iso: err.t_subject_iso,
+      cfg_sig: err.cfg_sig,
+      created_at_ms: err.created_at_ms,
+    });
+    await insertRawEvent(err);
+    return res.status(400).json({ ok: false, error: "secret_in_body_forbidden" });
+  }
+
+  try {
+    if (body.bundle_type === "TV_ALERT_BUNDLE" && Array.isArray(body.records)) {
+      // Transactionally ingest bundle records
+      for (const rec of body.records) {
+        await ingestLogicalRecord({ rec, auth_ok, request_id, ip_hash, user_agent_hash, t_received_ms });
+      }
+    } else {
+      // Single record
+      await ingestLogicalRecord({ rec: body, auth_ok, request_id, ip_hash, user_agent_hash, t_received_ms });
+    }
+
+    if (!auth_ok) {
+      return res.status(401).json({ ok: false, error: "unauthorized", request_id });
+    }
+    return res.json({ ok: true, request_id });
+  } catch (e) {
+    console.error("ingest failed:", e);
+    const err = buildIngressErrorRecord({
+      request_id,
+      ip_hash,
+      user_agent_hash,
+      t_received_ms,
+      reason: "ingest_exception:" + (e?.message || String(e)),
+      raw: "[REDACTED_AT_INGRESS]",
+    });
+    try {
+      await upsertRun({
+        run_id: err.run_id,
+        env: err.env,
+        deployment_id: err.deployment_id,
+        producer_id: err.producer_id,
+        timezone: err.timezone,
+        started_at_ms: err.t_subject_ms,
+        started_at_iso: err.t_subject_iso,
+        cfg_sig: err.cfg_sig,
+        created_at_ms: err.created_at_ms,
+      });
+      await insertRawEvent(err);
+    } catch (e2) {
+      console.error("failed to persist error record:", e2);
+    }
+    return res.status(500).json({ ok: false, error: "ingest_failed", request_id });
+  }
+}
+
+app.get("/healthz", async (req, res) => {
+  try {
+    await pool.query("select 1 as ok");
+    const c = await pool.query("select count(*)::bigint as n from raw_events");
+    const last = await pool.query("select max(t_received_ms)::bigint as last_ms from raw_events");
+    res.json({
+      ok: true,
+      env: RECEIVER_ENV,
+      db_ok: true,
+      raw_events: { count: c.rows[0].n, last_received_ms: last.rows[0].last_ms || null },
+      now: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, db_ok: false, error: e.message });
+  }
+});
+
+// TradingView expects /tv
+app.post("/tv", handleWebhook);
+// Alias
+app.post("/webhook", handleWebhook);
+
+dbSelfTest()
+  .then(() => {
+    app.listen(PORT, "0.0.0.0", () => console.log("listening on", PORT));
+  })
+  .catch((e) => {
+    console.error("FATAL: DB self-test failed. Did you apply migrations?", e);
+    process.exit(1);
+  });

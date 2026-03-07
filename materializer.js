@@ -5,10 +5,14 @@ const { Pool } = pg;
 /**
  * materializer.js
  *
- * Reads raw_events (inserted by the receiver /tv endpoint)
- * and writes typed BAR rows into a "bars" table (dedup primary key).
+ * Reads raw_events and writes typed BAR rows into a query-friendly `bars` table.
  *
- * Run command (per package.json): npm run materializer
+ * Compatibility stance:
+ * - legacy receiver rows that stored bundle payloads in `payload`
+ * - newer receiver rows that store one logical record per raw_events row in `payload_raw_redacted`
+ *
+ * Run command:
+ *   npm run materializer
  */
 
 const DATABASE_URL_RAW = (process.env.DATABASE_URL || "").trim();
@@ -17,17 +21,9 @@ if (!DATABASE_URL_RAW) {
   process.exit(1);
 }
 
-// DigitalOcean DB component commonly provides CA cert via ${.CA_CERT}.
-// Support both names (and keep compatibility with prior setup).
 const CA_CERT = (process.env.CA_CERT || process.env.DATABASE_CA_CERT || "").trim();
-
-// Set PGSSL_INSECURE=1 ONLY for a temporary debug bypass.
 const PGSSL_INSECURE = (process.env.PGSSL_INSECURE || "").trim() === "1";
 
-/**
- * Scrub sslmode from DATABASE_URL so our explicit `ssl:` config is the single source of truth.
- * This avoids "sslmode" parsing quirks / overrides in some Node pg flows.
- */
 function scrubDbUrl(url) {
   if (!url) return "";
   try {
@@ -35,18 +31,10 @@ function scrubDbUrl(url) {
     u.searchParams.delete("sslmode");
     return u.toString();
   } catch {
-    // Fallback if URL() can't parse (older/odd formats)
     return url.replace(/[?&]sslmode=[^&]+/i, "");
   }
 }
 
-/**
- * TLS strategy (same approach as receiver):
- * - If PGSSLMODE=disable => no SSL (not recommended for managed DBs).
- * - If CA_CERT present => verify TLS (recommended).
- * - Else if PGSSL_INSECURE=1 => encrypt but do not verify (debug only).
- * - Else => fail closed (forces correct CA config).
- */
 function pgSslConfig() {
   const pgsslmode = (process.env.PGSSLMODE || "").toLowerCase();
   if (pgsslmode === "disable") return false;
@@ -54,7 +42,7 @@ function pgSslConfig() {
   if (CA_CERT) {
     return {
       rejectUnauthorized: true,
-      ca: CA_CERT.replace(/\\n/g, "\n"),
+      ca: CA_CERT.replace(/\\n/g, "\n")
     };
   }
 
@@ -62,7 +50,6 @@ function pgSslConfig() {
     return { rejectUnauthorized: false };
   }
 
-  // Fail closed by default (forces proper CA configuration).
   return { rejectUnauthorized: true };
 }
 
@@ -71,7 +58,7 @@ const pool = new Pool({
   ssl: pgSslConfig(),
   max: 5,
   idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000,
+  connectionTimeoutMillis: 10_000
 });
 
 function sleep(ms) {
@@ -103,33 +90,7 @@ function toFloat(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-/**
- * Make the worker resilient if it starts before the receiver has created / migrated raw_events.
- * This mirrors the receiver’s forward-migration behavior.
- */
-async function ensureRawEventsSchema() {
-  await pool.query(`
-    create table if not exists raw_events (
-      id bigserial primary key,
-      received_at timestamptz not null default now(),
-      payload jsonb not null
-    );
-  `);
-
-  await pool.query(`alter table raw_events add column if not exists path text;`);
-  await pool.query(`alter table raw_events add column if not exists source_ip text;`);
-  await pool.query(`alter table raw_events add column if not exists user_agent text;`);
-
-  await pool.query(`
-    create index if not exists raw_events_received_at_idx
-    on raw_events (received_at desc);
-  `);
-}
-
 async function ensureMaterializerSchema() {
-  await ensureRawEventsSchema();
-
-  // 1) State table: remembers how far we got in raw_events
   await pool.query(`
     create table if not exists materializer_state (
       id int primary key,
@@ -144,29 +105,22 @@ async function ensureMaterializerSchema() {
     on conflict (id) do nothing;
   `);
 
-  // 2) Typed table: bars
-  // We use dedup as the primary key if it exists; payload includes "dedup" like:
-  // BAR|BINANCE:BTCUSDT.P|15|1771794900000
   await pool.query(`
     create table if not exists bars (
       dedup text primary key,
-
+      uid text,
       raw_event_id bigint not null,
       received_at timestamptz not null,
-
       symbol text not null,
       tf_sec int not null,
       tf text,
-
       t_open_ms bigint,
       t_close_ms bigint,
-
       open double precision,
       high double precision,
       low double precision,
       close double precision,
       volume double precision,
-
       spot_close double precision,
       oi_close double precision,
       funding_rate double precision,
@@ -174,15 +128,18 @@ async function ensureMaterializerSchema() {
       premium_idx double precision,
       basis double precision,
       basis_pct double precision,
-
       long_accounts double precision,
       short_accounts double precision,
-
       liq_buy double precision,
       liq_sell double precision,
-
       payload jsonb not null
     );
+  `);
+
+  await pool.query(`
+    create unique index if not exists bars_uid_uq
+    on bars (uid)
+    where uid is not null;
   `);
 
   await pool.query(`
@@ -194,8 +151,30 @@ async function ensureMaterializerSchema() {
     create index if not exists bars_received_at_idx
     on bars (received_at desc);
   `);
+}
 
-  console.log("materializer schema OK");
+function extractBarRecords(row) {
+  const out = [];
+
+  const directPayload = asObject(row.payload_raw_redacted) || asObject(row.payload);
+  if (row.row_type === "BAR" && directPayload) {
+    out.push(directPayload);
+    return out;
+  }
+
+  if (directPayload && Array.isArray(directPayload.records)) {
+    for (const rec of directPayload.records) {
+      const obj = asObject(rec);
+      if (obj && obj.row_type === "BAR") out.push(obj);
+    }
+    return out;
+  }
+
+  if (directPayload && directPayload.row_type === "BAR") {
+    out.push(directPayload);
+  }
+
+  return out;
 }
 
 async function materializeBatch(batchSize = 300) {
@@ -207,17 +186,20 @@ async function materializeBatch(batchSize = 300) {
     await client.query("begin");
 
     const st = await client.query(
-      "select last_raw_event_id from materializer_state where id=1 for update"
+      "select last_raw_event_id from materializer_state where id = 1 for update"
     );
     const lastId = BigInt(st.rows[0].last_raw_event_id || 0);
 
-    // Only materialize TradingView webhook rows
     const rs = await client.query(
       `
-        select id, received_at, path, payload
+        select
+          id,
+          received_at,
+          row_type,
+          payload_raw_redacted,
+          payload
         from raw_events
         where id > $1
-          and path = '/tv'
         order by id asc
         limit $2
       `,
@@ -225,33 +207,29 @@ async function materializeBatch(batchSize = 300) {
     );
 
     fetched = rs.rows.length;
-
     let newLast = lastId;
 
     for (const row of rs.rows) {
       const rawEventId = BigInt(row.id);
       if (rawEventId > newLast) newLast = rawEventId;
 
-      const payload = asObject(row.payload);
-      const records = Array.isArray(payload?.records) ? payload.records : [];
+      const records = extractBarRecords(row);
 
       for (let i = 0; i < records.length; i++) {
         const rec = asObject(records[i]) || {};
-
-        if ((rec.row_type || "") !== "BAR") continue;
-
         const symbol = (rec.symbol || "").toString();
         const tfSec = toInt(rec.tf_sec);
 
-        // Skip malformed BAR records (avoids NOT NULL violations)
         if (!symbol || tfSec === null) continue;
 
         const dedup = String(rec.dedup || rec.uid || `${row.id}:${i}`);
+        const uid = rec.uid ? String(rec.uid) : null;
 
         const q = await client.query(
           `
             insert into bars (
               dedup,
+              uid,
               raw_event_id,
               received_at,
               symbol,
@@ -277,28 +255,25 @@ async function materializeBatch(batchSize = 300) {
               liq_sell,
               payload
             ) values (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26
             )
             on conflict (dedup) do nothing
           `,
           [
             dedup,
-            row.id, // bigint in DB; pg may return string; DB will cast
+            uid,
+            row.id,
             row.received_at,
-
             symbol,
             tfSec,
             rec.tf ?? null,
-
             toInt(rec.t_open_ms),
             toInt(rec.t_close_ms),
-
             toFloat(rec.open),
             toFloat(rec.high),
             toFloat(rec.low),
             toFloat(rec.close),
             toFloat(rec.volume),
-
             toFloat(rec.spot_close),
             toFloat(rec.oi_close),
             toFloat(rec.funding_rate),
@@ -306,14 +281,11 @@ async function materializeBatch(batchSize = 300) {
             toFloat(rec.premium_idx),
             toFloat(rec.basis),
             toFloat(rec.basis_pct),
-
             toFloat(rec.long_accounts),
             toFloat(rec.short_accounts),
-
             toFloat(rec.liq_buy),
             toFloat(rec.liq_sell),
-
-            rec, // full record JSON
+            rec
           ]
         );
 
@@ -339,13 +311,13 @@ async function materializeBatch(batchSize = 300) {
     try {
       await client.query("rollback");
     } catch {
-      // ignore rollback errors
+      // ignore
     }
     return {
       ok: false,
       error: `${e?.code || ""} ${e?.message || e}`.trim(),
       fetched,
-      inserted,
+      inserted
     };
   } finally {
     client.release();
@@ -396,7 +368,6 @@ async function main() {
     }
 
     if (r.fetched === 0) {
-      // Nothing new
       await sleep(idleSleepMs);
       continue;
     }

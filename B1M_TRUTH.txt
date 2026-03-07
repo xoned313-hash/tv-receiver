@@ -1,0 +1,1508 @@
+//@version=6
+indicator("B1M v2.0.1 (DB-First Contract Logger)", "B1M v2.0.1", overlay=true, precision=4, max_labels_count=500, dynamic_requests=true)
+
+// IMPORTANT ALERT SETUP (TradingView)
+//  • Create alert: Condition = "Any alert() function call"
+//  • Webhook URL:  https://<YOUR_DO_INGEST_ENDPOINT>/tv?secret=<WEBHOOK_SECRET>
+//  • Message:      {{message}}   (must be EXACTLY this)
+//  • Frequency:    Once Per Bar Close
+//  • Do NOT place secrets in the JSON body (prod receiver rejects body secrets); use the URL query param.
+
+import TradingView/Request/3 as req
+
+//───────────────────────────────────────────────────────────────────────────
+// 0 · Logging + Schema inputs
+//───────────────────────────────────────────────────────────────────────────
+groupLog      = "Logging"
+enableLogging = input.bool(true,  "Enable logging (JSON/CSV)", group = groupLog)
+sep           = input.string(",", "CSV separator",            group = groupLog)
+
+//───────────────────────────────────────────────────────────────────────────
+// 0b · Output mode + forensic schema (A1M-level)
+//───────────────────────────────────────────────────────────────────────────
+groupOut = "Output Mode (Any alert())"
+emitMode = input.string("BUNDLE_JSON", "Emit", options=["BUNDLE_JSON","JSON","CSV","OFF"], group=groupOut,
+     tooltip="BUNDLE_JSON = one webhook payload per bar close containing multiple records (CONFIG/BAR/EVAL...). DB-first; fixes CONFIG-vs-BAR suppression.\n\nJSON = single-record JSON per bar close (legacy). CSV = raw CSV line only (legacy). OFF = send nothing.\n\nIMPORTANT: TradingView often delivers only one alert() message per bar close. This script is engineered to emit at most one alert() per bar close.")
+bool MODE_BUNDLE_JSON = (emitMode == "BUNDLE_JSON")
+bool MODE_JSON_SINGLE = (emitMode == "JSON")
+bool MODE_JSON        = (MODE_BUNDLE_JSON or MODE_JSON_SINGLE)
+bool MODE_CSV         = (emitMode == "CSV")
+includeCsvInJson = input.bool(true, "Include csv field inside JSON", group=groupOut,
+     tooltip="If true, JSON includes a `csv` field. If false, JSON omits it (recommended if payload size matters).")
+
+groupFor = "Forensic (CONFIG/EVAL)"
+emitConfigOnChange = input.bool(true, "Emit CONFIG on start + config change", group=groupFor)
+configBeaconEveryBars = input.int(10, "CONFIG beacon every N bars (0=off)", minval=0, maxval=100000, group=groupFor,
+     tooltip="If >0, includes CONFIG in the bundle every N realtime bar closes as a safety beacon.\n\nIn BUNDLE_JSON mode, CONFIG is bundled with BAR so it does NOT suppress BAR telemetry.")
+configWarmupBars = input.int(4, "CONFIG warmup repeats (bars)", minval=0, maxval=50, group=groupFor,
+     tooltip="When >0 (JSON mode), include CONFIG in the bundle for the first N realtime bar closes after the run starts (warmup repeats).\n\nIn BUNDLE_JSON mode, CONFIG is bundled with BAR so it does NOT suppress BAR telemetry.")
+enableEvalHorizon  = input.bool(false, "Emit EVAL horizons (extra alerts)", group=groupFor,
+     tooltip="If enabled, emits EVAL rows after W bars with windowHigh/Low primitives linked to the parent BAR uid.")
+evalW1 = input.int(4,  "EVAL W1 (bars)", minval=1, maxval=500,  group=groupFor, inline="e1")
+evalW2 = input.int(12, "EVAL W2 (bars)", minval=1, maxval=2000, group=groupFor, inline="e1")
+evalW3 = input.int(24, "EVAL W3 (bars)", minval=1, maxval=5000, group=groupFor, inline="e1")
+maxPendingEvals = input.int(500, "Max pending eval parents", minval=50, maxval=5000, group=groupFor)
+includeCsvHeaderInConfig = input.bool(false, "CONFIG: include csv_header", group=groupFor,
+     tooltip="Optional. If true, CONFIG includes a csv_header string matching buildLine() order. Note: may push CONFIG over TradingView alert-size limits; keep OFF if CONFIG drops.")
+emitCsvHeaderLine = input.bool(false, "CSV: emit header line on start/config change", group=groupFor,
+     tooltip="If true and MODE_CSV, emits the CSV header as its own alert line on start/config change (useful for CSV-only logging).")
+
+//───────────────────────────────────────────────────────────────────────────
+// 0b2 · Experiment meta + logging window
+//───────────────────────────────────────────────────────────────────────────
+groupMeta = "Experiment Meta"
+expId   = input.string("EXP_B1M", "Experiment ID", group=groupMeta)
+expNote = input.string("", "Experiment Note (manual only)", group=groupMeta)
+
+groupWin = "Experiment Window"
+useLogDateFilter = input.bool(true, "Log only after start date", group=groupWin)
+logStartDate = input.time(1764979200000, "Log start date/time (UTC)", group=groupWin)  // 2025-12-06 00:00:00 UTC
+
+// Sanitized note for payload safety (no newlines)
+f_sanitize_note(s) =>
+    s1 = str.replace_all(s, "\n", " ")
+    s2 = str.replace_all(s1, "\t", " ")
+    s2
+
+string expNoteSafe = f_sanitize_note(expNote)
+
+// Logging window gate (applies to BAR/EVAL and CSV lines; CONFIG is NOT blocked by window)
+inLogWindow = enableLogging and (not useLogDateFilter or time_close >= logStartDate)
+
+//───────────────────────────────────────────────────────────────────────────
+// 0 · Provenance + identity (script instance run + seq)
+//───────────────────────────────────────────────────────────────────────────
+var string run_id = ""
+var int    warmup_left = 0
+var int    run_rt_bar_count = 0  // confirmed realtime bar counter (run-relative; used for CONFIG beacons)
+var bool   config_sent = false
+if barstate.isrealtime and str.length(run_id) == 0
+    run_id := "RUN|" + str.tostring(timenow)
+    warmup_left := (MODE_JSON and configWarmupBars > 0) ? configWarmupBars : 0
+    run_rt_bar_count := 0
+
+
+var int seq = 0  // monotonic per runtime; incremented ONLY at emit call-sites (no function mutation)
+
+//───────────────────────────────────────────────────────────────────────────
+// Constants
+//───────────────────────────────────────────────────────────────────────────
+const int SCHEMA_VERSION_INT = 3
+const string LOG_TAG = "B1M_DB_V1"
+const string PRODUCER = "B1M_Pine"
+const string PRODUCER_VERSION = "2.0.1"
+
+//───────────────────────────────────────────────────────────────────────────
+// Helper: format chart timeframe as 15M / 1H / 4H / 1D / 1W / 1MO
+//───────────────────────────────────────────────────────────────────────────
+tfTag() =>
+    int m = timeframe.multiplier
+    if timeframe.isseconds
+        str.tostring(m) + "S"
+    else if timeframe.isminutes
+        m % 60 == 0 ? str.tostring(m / 60) + "H" : str.tostring(m) + "M"
+    else if timeframe.isdaily
+        str.tostring(m) + "D"
+    else if timeframe.isweekly
+        str.tostring(m) + "W"
+    else if timeframe.ismonthly
+        str.tostring(m) + "MO"
+    else
+        timeframe.period
+
+//───────────────────────────────────────────────────────────────────────────
+
+// Canonical BAR uid (stable across runs; join key across scripts)
+make_bar_uid() =>
+    "BAR|" + syminfo.tickerid + "|" + timeframe.period + "|" + str.tostring(time_close)
+
+// 0 · Schema / Provenance inputs
+//───────────────────────────────────────────────────────────────────────────
+groupSchema   = "Schema / Provenance"
+jsonSchemaVersion = input.string("B1M_EVENT_v1.0", "json_schema_version", group=groupSchema)
+schemaVersion     = input.string("B1M_WIDE_v1.0",  "wide_schema_version", group=groupSchema)
+csvSchemaVersion  = input.string("B1M_CSV_v1.0",   "csv_schema_version", group=groupSchema)
+scriptId      = input.string("B1M_build_001", "script_id", group=groupSchema)
+
+// script_sha is baked into the code (no Input) to eliminate manual copy/paste.
+// Build rule: SCRIPT_SHA = sha256(script text where the SCRIPT_SHA literal is replaced by 64 zeros).
+// This avoids the self-hash paradox while ensuring the SHA changes whenever the code changes.
+const string SCRIPT_SHA = "484354ba9d7172ad55ace430da709cca19377c78a8fdcf5145d333154621526a"
+string scriptSha = SCRIPT_SHA
+const int TV_MAX_PAYLOAD_CHARS = 39000  // DB-first: allow near-full TV webhook payload (<= 40960)  // Safety margin under TradingView alert message size caps
+
+universeId    = input.string("B1M", "universe_id", group=groupSchema)
+envId         = input.string("dev", "env (dev|staging|prod)", group=groupSchema)
+deploymentId  = input.string("tv_alerts_001", "deployment_id", group=groupSchema)
+timezoneId    = input.string("America/Detroit", "timezone_id (IANA)", group=groupSchema,
+     tooltip="Used by the receiver/DB for local date/session derivations; Pine times remain UTC ms.")
+schemaRegVer  = input.string("P1.2-2.2-draft.1", "schema_registry_version", group=groupSchema)
+schemaRegHash = input.string("", "schema_registry_hash (sha256)", group=groupSchema,
+     tooltip="Set to sha256 of SCHEMA_REGISTRY.json. Required for env=prod (will runtime.error if blank/invalid).")
+
+// Auto-detect tag from chart; optional override if you truly need manual control.
+alertTagOverride = input.string("", "alert_tag override (optional)", group=groupSchema,
+     tooltip="Leave blank to auto-tag as TICKER__TF (e.g., BTCUSDT.P__1H). If filled, this exact value is used.")
+alertTagSuffix = input.string("", "alert_tag suffix (optional)", group=groupSchema,
+     tooltip="Example: suffix 'A' -> BTCUSDT.P__1H__A")
+
+string _autoTag  = syminfo.ticker + "__" + tfTag()
+string _baseTag  = str.length(alertTagOverride) > 0 ? alertTagOverride : _autoTag
+string alertTag  = str.length(alertTagSuffix) > 0 ? (_baseTag + "__" + alertTagSuffix) : _baseTag
+
+priceQuote    = input.string("USDT", "price_quote", group=groupSchema)
+contractsDef  = input.string("contracts = base units for linear USDT-margined perp (exchange-defined)", "contracts_def", group=groupSchema)
+
+//───────────────────────────────────────────────────────────────────────────
+// 0c · Derivatives inputs (Premium/Basis only; no visuals)
+//───────────────────────────────────────────────────────────────────────────
+groupDerivs = "Derivatives (Premium/Basis)"
+spotOverride    = input.string("", "Spot symbol override (e.g., BINANCE:SUIUSDT)", group=groupDerivs)
+premiumOverride = input.string("", "Premium symbol override (e.g., BINANCE:SUIUSDT_PREMIUM)", group=groupDerivs)
+
+//───────────────────────────────────────────────────────────────────────────
+// 0d · Derivatives metrics via Request library (Funding/LS/Liq/OI)
+//───────────────────────────────────────────────────────────────────────────
+groupReq = "Derivatives (Funding/LS/Liq/OI · Request)"
+enableDerivsReq = input.bool(true, "Include Request derivs metrics in JSON", group=groupReq)
+
+useChartSymReq  = input.bool(true,  "Req: use chart symbol as primary", group=groupReq)
+symPrimaryReqIn = input.symbol("BINANCE:AVAXUSDT.P", "Req: primary symbol (if not using chart)", group=groupReq)
+symFallbackReq  = input.symbol("BINANCE:BTCUSDT.P",  "Req: fallback symbol (safety net)", group=groupReq)
+
+reqGaps         = input.bool(false, "Req: gaps", group=groupReq)
+reqRepaint      = input.bool(false, "Req: repaint (false = confirmed only)", group=groupReq)
+
+// Fail-closed if Request OI missing (canonical OI)
+oiFailHardReq   = input.bool(false, "Error if Request OI missing", group=groupReq)
+
+// Funding units label for funding_rate (audit + downstream unit clarity)
+fundingUnits = input.string("pp", "Funding units (pp|bps|decimal)", options=["pp","bps","decimal"], group=groupReq,
+     tooltip="Unit label for funding_rate from the TradingView Request library.\n- pp = percent points (e.g., 0.01 means 0.01%)\n- bps = basis points (e.g., 1 means 1bp = 0.01%)\n- decimal = fraction (e.g., 0.0001 means 1bp)")
+
+//───────────────────────────────────────────────────────────────────────────
+// 1 · JSON + CSV helpers (HARDENED)
+//───────────────────────────────────────────────────────────────────────────
+jesc(s) =>
+    s1 = str.replace_all(s, "\\", "\\\\")
+    s2 = str.replace_all(s1, "\"", "\\\"")
+    s3 = str.replace_all(s2, "\n", "\\n")
+    s4 = str.replace_all(s3, "\t", "\\t")
+    s4
+
+
+jnum(x) => na(x) ? "null" : str.tostring(x)
+jstrE(s) => (na(s) or str.length(s) == 0) ? "null" : "\"" + jesc(s) + "\""
+jbool(b) => b ? "true" : "false"
+
+// CSV helpers: emit empty field for na
+csvnum(x) => na(x) ? "" : str.tostring(x)
+
+//───────────────────────────────────────────────────────────────────────────
+// 1b · Symbol validation + safe request.security wrappers
+//───────────────────────────────────────────────────────────────────────────
+f_is_valid(sym) =>
+    str.length(sym) > 0 and str.contains(sym, ":") and not str.contains(sym, "{") and not str.contains(sym, "}") and not str.contains(sym, "\"")
+
+f_sym_or_blank(sym) =>
+    f_is_valid(sym) ? sym : ""
+
+// NOTE: ignore_invalid_symbol=true prevents runtime failure; we expose quality flags downstream
+f_get(sym) =>
+    s = f_sym_or_blank(sym)
+    str.length(s) == 0 ? na : request.security(s, timeframe.period, close, ignore_invalid_symbol=true, lookahead=barmerge.lookahead_off)
+
+// Auto-derive spot/premium if overrides are blank (requires dynamic_requests=true)
+baseTickerId = ticker.standard(syminfo.tickerid)
+isPerp       = str.contains(baseTickerId, ".P")
+spotAuto     = isPerp ? str.replace(baseTickerId, ".P", "") : ""
+premiumAuto  = isPerp ? str.format("{0}_PREMIUM", spotAuto) : ""
+
+spotSym      = f_is_valid(spotOverride)    ? spotOverride    : spotAuto
+premiumSym   = f_is_valid(premiumOverride) ? premiumOverride : premiumAuto
+
+// Parse exchange + symbol from tickerid (best-effort)
+f_exchange_from_tickerid(tid) =>
+    parts = str.split(tid, ":")
+    array.size(parts) > 1 ? array.get(parts, 0) : ""
+
+f_symbol_from_tickerid(tid) =>
+    parts = str.split(tid, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : tid
+
+exchangeId = f_exchange_from_tickerid(syminfo.tickerid)
+symbolId   = f_symbol_from_tickerid(syminfo.tickerid)
+instrumentType = isPerp ? "perp" : "spot"
+
+//───────────────────────────────────────────────────────────────────────────
+// 1c · TF normalization (seconds) for batching + auditability
+//───────────────────────────────────────────────────────────────────────────
+f_int_prefix(s) =>
+    if str.length(s) == 0
+        na
+    else
+        string out = ""
+        for i = 0 to str.length(s) - 1
+            string ch = str.substring(s, i, i + 1)
+            if str.contains("0123456789", ch)
+                out += ch
+            else
+                break
+        str.length(out) == 0 ? na : int(str.tonumber(out))
+
+f_tf_seconds_from_period(tfStr) =>
+    string s = str.upper(tfStr)
+    int n = f_int_prefix(s)
+    bool allDigits = not na(n) and str.tostring(n) == s
+    if allDigits
+        n * 60
+    else if str.endswith(s, "S")
+        na(n) ? na : n
+    else if str.endswith(s, "H")
+        na(n) ? na : n * 3600
+    else if str.endswith(s, "D") or s == "D"
+        (s == "D") ? 86400 : (na(n) ? na : n * 86400)
+    else if str.endswith(s, "W") or s == "W"
+        (s == "W") ? 604800 : (na(n) ? na : n * 604800)
+    else if str.endswith(s, "M") or s == "M"
+        (s == "M") ? 2592000 : (na(n) ? na : n * 2592000)
+    else
+        na
+
+//───────────────────────────────────────────────────────────────────────────
+// 1d · Fibonacci pivots + pivot helpers
+//───────────────────────────────────────────────────────────────────────────
+f_pivFib(tf) =>
+    [ph, pl, pc] = request.security(syminfo.tickerid, tf, [high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
+    p     = (ph + pl + pc) / 3.0
+    rng   = ph - pl
+    r1 = p + 0.382 * rng
+    r2 = p + 0.618 * rng
+    r3 = p + 1.000 * rng
+    s1 = p - 0.382 * rng
+    s2 = p - 0.618 * rng
+    s3 = p - 1.000 * rng
+    [p, r1, r2, r3, s1, s2, s3]
+
+f_absPctDiff(price, level) =>
+    (na(level) or price == 0.0) ? na : 100.0 * math.abs(price - level) / price
+
+f_nearestPivot(price, p, r1, r2, r3, s1, s2, s3) =>
+    float bestVal  = na
+    float bestAbs  = na
+    string bestCode = ""
+    float d = na
+    if not na(p)
+        bestVal := p
+        bestAbs := math.abs(price - p)
+        bestCode := "P"
+    if not na(r1)
+        d := math.abs(price - r1)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := r1
+            bestCode := "R1"
+    if not na(r2)
+        d := math.abs(price - r2)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := r2
+            bestCode := "R2"
+    if not na(r3)
+        d := math.abs(price - r3)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := r3
+            bestCode := "R3"
+    if not na(s1)
+        d := math.abs(price - s1)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := s1
+            bestCode := "S1"
+    if not na(s2)
+        d := math.abs(price - s2)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := s2
+            bestCode := "S2"
+    if not na(s3)
+        d := math.abs(price - s3)
+        if na(bestAbs) or d < bestAbs
+            bestAbs := d
+            bestVal := s3
+            bestCode := "S3"
+    bestPct = price == 0.0 or na(bestAbs) ? na : 100.0 * bestAbs / price
+    [bestVal, bestAbs, bestPct, bestCode]
+
+//───────────────────────────────────────────────────────────────────────────
+// 1e · Request-library helpers
+//───────────────────────────────────────────────────────────────────────────
+f_req_primary_sym() =>
+    useChartSymReq ? syminfo.tickerid : symPrimaryReqIn
+
+// Dual-context request helper: ALWAYS touches both primary + fallback contexts on every bar.
+// This prevents runtime errors like:
+// "Cannot call a request.*() function ... from the new context on realtime bars."
+f_req_metric2(symP, symF, metricName, tfReq, gaps, repaint) =>
+    vP = req.cryptoDerivativeMetric(symP, metricName, tfReq, gaps, repaint)
+    vF = req.cryptoDerivativeMetric(symF, metricName, tfReq, gaps, repaint)
+    if na(vP)
+        [vF, true]
+    else
+        [vP, false]
+
+f_req_oi_close2(symP, symF, tfReq, gaps, repaint) =>
+    [oi_a1, oi_b1, oi_c1, oi_close1, oi_e1] = req.openInterestCrypto(symP, tfReq, gaps, repaint)
+    [oi_a2, oi_b2, oi_c2, oi_close2, oi_e2] = req.openInterestCrypto(symF, tfReq, gaps, repaint)
+    if na(oi_close1)
+        [oi_close2, true]
+    else
+        [oi_close1, false]
+
+//───────────────────────────────────────────────────────────────────────────
+// 1f · Emit gates (CONFIG not blocked by log window; BAR/EVAL are)
+//───────────────────────────────────────────────────────────────────────────
+meta_ok() =>
+    enableLogging and emitMode != "OFF" and barstate.isconfirmed and barstate.isrealtime
+
+// Realtime intrabar meta emits (v1.7+): allows CONFIG beacons without waiting for bar close
+meta_ok_rt() =>
+    enableLogging and emitMode != "OFF" and barstate.isrealtime
+
+data_ok() =>
+    enableLogging and inLogWindow and emitMode != "OFF" and barstate.isconfirmed and barstate.isrealtime
+
+emitMetaAlert(msg) =>
+    if meta_ok()
+        alert(msg, alert.freq_once_per_bar_close)
+
+emitMetaAlertRt(msg) =>
+    // Intrabar: triggers on first realtime update of a bar
+    if meta_ok_rt()
+        alert(msg, alert.freq_once_per_bar)
+
+
+emitDataAlert(msg) =>
+    if data_ok()
+        alert(msg, alert.freq_once_per_bar_close)
+
+//───────────────────────────────────────────────────────────────────────────
+// 2 · Config signature (producer fingerprint)
+//───────────────────────────────────────────────────────────────────────────
+sbool(b) => b ? "1" : "0"
+
+// Sanitize values used in cfg_sig (raw signature). Avoids accidental delimiter collisions.
+cfgv(s) =>
+    s1 = str.replace_all(s, "|", "/")
+    s2 = str.replace_all(s1, "\n", " ")
+    s3 = str.replace_all(s2, "\t", " ")
+    s3
+
+// cfg_sig: compact raw signature used as the BAR/EVAL join key (must stay short for receiver cache keys).
+// cfg_sig_full: canonical JSON string used by the receiver to compute sha256(cfg_sig_full).
+make_cfg_sig() =>
+    // Keep cfg_sig bounded: use a short prefix of script_sha (full sha lives in cfg_sig_full + CONFIG payload).
+    string sha_short = str.length(scriptSha) > 28 ? (str.substring(scriptSha, 0, 16) + "." + str.substring(scriptSha, str.length(scriptSha) - 8, str.length(scriptSha))) : scriptSha
+    string s = cfgv(jsonSchemaVersion)
+    s := s + "|" + cfgv(schemaVersion)
+    s := s + "|" + cfgv(csvSchemaVersion)
+    s := s + "|" + cfgv(scriptId)
+    s := s + "|" + cfgv(sha_short)
+    s := s + "|" + cfgv(universeId)
+    s := s + "|" + cfgv(envId)
+    s := s + "|" + cfgv(deploymentId)
+    s := s + "|" + cfgv(timezoneId)
+    s := s + "|" + cfgv(schemaRegVer)
+    s := s + "|" + cfgv(schemaRegHash)
+    s := s + "|" + cfgv(alertTag)
+    s := s + "|" + cfgv(priceQuote)
+    s := s + "|" + cfgv(sep)
+    s := s + "|" + cfgv(emitMode)
+    s := s + "|" + sbool(includeCsvInJson)
+    s := s + "|" + sbool(emitConfigOnChange)
+    s := s + "|" + str.tostring(configBeaconEveryBars)
+    s := s + "|" + str.tostring(configWarmupBars)
+    s := s + "|" + sbool(emitCsvHeaderLine)
+    s := s + "|" + sbool(enableEvalHorizon)
+    s := s + "|" + str.tostring(evalW1)
+    s := s + "|" + str.tostring(evalW2)
+    s := s + "|" + str.tostring(evalW3)
+    s := s + "|" + str.tostring(maxPendingEvals)
+    s := s + "|" + sbool(useLogDateFilter)
+    s := s + "|" + str.tostring(logStartDate)
+    s := s + "|" + cfgv(expId)
+    s := s + "|" + cfgv(spotOverride)
+    s := s + "|" + cfgv(premiumOverride)
+    s := s + "|" + sbool(enableDerivsReq)
+    s := s + "|" + sbool(useChartSymReq)
+    s := s + "|" + cfgv(str.tostring(symPrimaryReqIn))
+    s := s + "|" + cfgv(str.tostring(symFallbackReq))
+    s := s + "|" + sbool(reqGaps)
+    s := s + "|" + sbool(reqRepaint)
+    s := s + "|" + sbool(oiFailHardReq)
+    s := s + "|" + cfgv(fundingUnits)
+    s
+
+make_cfg_sig_full_json() =>
+    string s = "{"
+    s += "\"json_schema_version\":" + jstrE(jsonSchemaVersion)
+    s += ",\"wide_schema_version\":" + jstrE(schemaVersion)
+    s += ",\"csv_schema_version\":" + jstrE(csvSchemaVersion)
+    s += ",\"script_id\":" + jstrE(scriptId)
+    s += ",\"script_sha\":" + jstrE(scriptSha)
+    s += ",\"universe_id\":" + jstrE(universeId)
+    s += ",\"env\":" + jstrE(envId)
+    s += ",\"deployment_id\":" + jstrE(deploymentId)
+    s += ",\"timezone_id\":" + jstrE(timezoneId)
+    s += ",\"schema_registry_version\":" + jstrE(schemaRegVer)
+    s += ",\"schema_registry_hash\":" + jstrE(schemaRegHash)
+    s += ",\"alert_tag\":" + jstrE(alertTag)
+    s += ",\"price_quote\":" + jstrE(priceQuote)
+    s += ",\"sep\":" + jstrE(sep)
+    s += ",\"emit_mode\":" + jstrE(emitMode)
+    s += ",\"include_csv_in_json\":" + jbool(includeCsvInJson)
+    s += ",\"emit_config_on_change\":" + jbool(emitConfigOnChange)
+    s += ",\"config_beacon_every_bars\":" + jnum(configBeaconEveryBars)
+    s += ",\"config_warmup_bars\":" + jnum(configWarmupBars)
+    s += ",\"emit_csv_header_line\":" + jbool(emitCsvHeaderLine)
+    s += ",\"enable_eval_horizon\":" + jbool(enableEvalHorizon)
+    s += ",\"eval_w1\":" + jnum(evalW1)
+    s += ",\"eval_w2\":" + jnum(evalW2)
+    s += ",\"eval_w3\":" + jnum(evalW3)
+    s += ",\"max_pending_evals\":" + jnum(maxPendingEvals)
+    s += ",\"use_log_date_filter\":" + jbool(useLogDateFilter)
+    s += ",\"log_start_date_ms\":" + jnum(logStartDate)
+    s += ",\"exp_id\":" + jstrE(expId)
+    s += ",\"spot_override\":" + jstrE(spotOverride)
+    s += ",\"premium_override\":" + jstrE(premiumOverride)
+    s += ",\"enable_derivs_req\":" + jbool(enableDerivsReq)
+    s += ",\"use_chart_sym_req\":" + jbool(useChartSymReq)
+    s += ",\"sym_primary_req\":" + jstrE(str.tostring(symPrimaryReqIn))
+    s += ",\"sym_fallback_req\":" + jstrE(str.tostring(symFallbackReq))
+    s += ",\"req_gaps\":" + jbool(reqGaps)
+    s += ",\"req_repaint\":" + jbool(reqRepaint)
+    s += ",\"oi_fail_hard\":" + jbool(oiFailHardReq)
+    s += ",\"funding_units\":" + jstrE(fundingUnits)
+    s += "}"
+    s
+
+string cfg_sig_full = make_cfg_sig_full_json()
+string cfg_sig = make_cfg_sig()
+
+var string last_cfg_sig = ""
+cfg_changed = cfg_sig != last_cfg_sig
+
+//───────────────────────────────────────────────────────────────────────────
+// 3 · Canonical series used by CSV + JSON
+//───────────────────────────────────────────────────────────────────────────
+spotCloseSeries = f_get(spotSym)
+premIdxSeries   = f_get(premiumSym)
+
+// --- Request metrics (canonical series; computed on ALL bars) ---
+// IMPORTANT: Do not call request.*() inside emit-time functions.
+// These request contexts must be established on historical bars,
+// otherwise TradingView will throw "Cannot call a request.*() function ... from the new context on realtime bars."
+var float  oiBestSeries = na
+var bool   oiBestUsedFallback = false
+
+var float  lsRatioAccountsBest = na
+var bool   lsRatioAccountsUsedFallbackBest = false
+var float  longAccountsBest = na
+var bool   longAccountsUsedFallbackBest = false
+var float  shortAccountsBest = na
+var bool   shortAccountsUsedFallbackBest = false
+var float  liqBuyBest = na
+var bool   liqBuyUsedFallbackBest = false
+var float  liqSellBest = na
+var bool   liqSellUsedFallbackBest = false
+var float  fundingRateBest = na
+var bool   fundingUsedFallbackBest = false
+var string fundingSymUsedBest = ""
+
+// Per-bar series (assigned each bar; then frozen into *Best on confirmed bars)
+float  oi_close_series = na
+bool   oi_used_fallback_series = false
+
+float  ls_ratio_accounts_series = na
+bool   ls_used_fallback_series = false
+float  long_accounts_series = na
+bool   long_used_fallback_series = false
+float  short_accounts_series = na
+bool   short_used_fallback_series = false
+float  liq_buy_series = na
+bool   liq_buy_used_fallback_series = false
+float  liq_sell_series = na
+bool   liq_sell_used_fallback_series = false
+float  funding_rate_series = na
+bool   funding_used_fallback_series = false
+string funding_sym_used_series = ""
+
+if enableDerivsReq
+    // NOTE: These calls run on historical bars too (global scope), which is required for realtime safety.
+    string symP_req = f_req_primary_sym()
+    string symF_req = symFallbackReq
+    string tfReq_req = timeframe.period
+
+    [oi_tmp, oi_fb] = f_req_oi_close2(symP_req, symF_req, tfReq_req, reqGaps, reqRepaint)
+    oi_close_series := oi_tmp
+    oi_used_fallback_series := oi_fb
+
+    [ls_tmp_val, ls_tmp_fb] = f_req_metric2(symP_req, symF_req, "Long/Short Ratio Accounts", tfReq_req, reqGaps, reqRepaint)
+    ls_ratio_accounts_series := ls_tmp_val
+    ls_used_fallback_series := ls_tmp_fb
+
+    [la_tmp_val, la_tmp_fb] = f_req_metric2(symP_req, symF_req, "Long Accounts", tfReq_req, reqGaps, reqRepaint)
+    long_accounts_series := la_tmp_val
+    long_used_fallback_series := la_tmp_fb
+
+    [sa_tmp_val, sa_tmp_fb] = f_req_metric2(symP_req, symF_req, "Short Accounts", tfReq_req, reqGaps, reqRepaint)
+    short_accounts_series := sa_tmp_val
+    short_used_fallback_series := sa_tmp_fb
+
+    [lb_tmp_val, lb_tmp_fb] = f_req_metric2(symP_req, symF_req, "Liquidations Buy", tfReq_req, reqGaps, reqRepaint)
+    liq_buy_series := lb_tmp_val
+    liq_buy_used_fallback_series := lb_tmp_fb
+
+    [lsell_tmp_val, lsell_tmp_fb] = f_req_metric2(symP_req, symF_req, "Liquidations Sell", tfReq_req, reqGaps, reqRepaint)
+    liq_sell_series := lsell_tmp_val
+    liq_sell_used_fallback_series := lsell_tmp_fb
+
+    // Funding: call BOTH contexts every bar; select primary if present, else fallback.
+    float fP = req.cryptoDerivativeMetric(symP_req, "Funding Rate", tfReq_req, reqGaps, reqRepaint)
+    float fF = req.cryptoDerivativeMetric(symF_req, "Funding Rate", tfReq_req, reqGaps, reqRepaint)
+    funding_used_fallback_series := na(fP)
+    funding_sym_used_series := funding_used_fallback_series ? str.tostring(symF_req) : str.tostring(symP_req)
+    funding_rate_series := funding_used_fallback_series ? fF : fP
+
+if barstate.isconfirmed
+    oiBestSeries := oi_close_series
+    oiBestUsedFallback := oi_used_fallback_series
+
+    lsRatioAccountsBest := ls_ratio_accounts_series
+    lsRatioAccountsUsedFallbackBest := ls_used_fallback_series
+    longAccountsBest := long_accounts_series
+    longAccountsUsedFallbackBest := long_used_fallback_series
+    shortAccountsBest := short_accounts_series
+    shortAccountsUsedFallbackBest := short_used_fallback_series
+    liqBuyBest := liq_buy_series
+    liqBuyUsedFallbackBest := liq_buy_used_fallback_series
+    liqSellBest := liq_sell_series
+    liqSellUsedFallbackBest := liq_sell_used_fallback_series
+    fundingRateBest := funding_rate_series
+    fundingUsedFallbackBest := funding_used_fallback_series
+    fundingSymUsedBest := funding_sym_used_series
+
+//───────────────────────────────────────────────────────────────────────────
+// 4 · Metric pack → CSV line (ordering versioned by csv_schema_version)
+//     (Called every bar so ta.* state is consistent.)
+//───────────────────────────────────────────────────────────────────────────
+buildLine() =>
+    tClose = time_close
+    tOpen  = time
+    tfP    = timeframe.period
+    tkid   = syminfo.tickerid
+    bi     = bar_index
+
+    o    = open
+    h    = high
+    l    = low
+    c    = close
+    v    = volume
+    hl2v = hl2
+
+    ret1 = (not na(c[1]) and c[1] != 0.0) ? (c - c[1]) / c[1] : na
+
+    volUsd = v * c
+    volUsdSma30  = ta.sma(volUsd, 30)
+    volUsdSma240 = ta.sma(volUsd, 240)
+    rvol30  = volUsdSma30  != 0.0 ? volUsd / volUsdSma30  : na
+    rvol240 = volUsdSma240 != 0.0 ? volUsd / volUsdSma240 : na
+
+    oiBest    = oiBestSeries
+    oiHasData = not na(oiBest)
+    oiRet1    = (not na(oiBest) and not na(oiBest[1]) and oiBest[1] != 0.0) ? (oiBest - oiBest[1]) / oiBest[1] : na
+    oiNotional= oiHasData ? (oiBest * c) : na
+
+    spotClose   = spotCloseSeries
+    premIdx     = premIdxSeries
+    basis       = na(spotClose) ? na : (c - spotClose)
+    basisPct    = na(spotClose) ? na : (basis / spotClose)
+
+    sma20       = ta.sma(c, 20)
+    ema50       = ta.ema(c, 50)
+    avgPrice100 = ta.sma(c, 100)
+
+    lrLen    = 100
+    lrMid    = ta.linreg(c, lrLen, 0)
+    lrMidPrev= ta.linreg(c, lrLen, 1)
+    lrSlope  = lrMid - lrMidPrev
+
+    stAtrLen       = 10
+    stFactor       = 3.0
+    [stLine, stDirRaw] = ta.supertrend(stFactor, stAtrLen)
+    stDir          = stDirRaw
+
+    atr14  = ta.atr(14)
+    hvLen  = 10
+    tf_sec_local = f_tf_seconds_from_period(timeframe.period)
+    tf_days = na(tf_sec_local) ? na : (tf_sec_local / 86400.0)
+    logret = (not na(c[1]) and c[1] > 0.0) ? math.log(c / c[1]) : na
+    st = ta.stdev(logret, hvLen)
+    hv10 = (na(tf_days) or tf_days <= 0.0 or na(st)) ? na : 100.0 * st * math.sqrt(365.0 / tf_days)
+
+    bbLen   = 20
+    bbMult  = 2.0
+    bbBasis = ta.sma(c, bbLen)
+    bbDev   = bbMult * ta.stdev(c, bbLen)
+    bbUpper = bbBasis + bbDev
+    bbLower = bbBasis - bbDev
+
+    kcLen   = 20
+    kcMult  = 2.0
+    kcMa    = ta.ema(c, kcLen)
+    kcAtr   = ta.atr(10)
+    kcUpper = kcMa + kcAtr * kcMult
+    kcLower = kcMa - kcAtr * kcMult
+
+    dcLen   = 20
+    dcUpper = ta.highest(h, dcLen)
+    dcLower = ta.lowest(l, dcLen)
+    dcMid   = (dcUpper + dcLower) * 0.5
+
+    chopLen = 14
+    sumAtr  = math.sum(ta.atr(1), chopLen)
+    hh      = ta.highest(h, chopLen)
+    ll      = ta.lowest(l, chopLen)
+    chop    = hh != ll and chopLen > 0 ? 100.0 * math.log10(sumAtr / (hh - ll)) / math.log10(chopLen) : na
+
+    rsi14 = ta.rsi(c, 14)
+
+    rsi1   = ta.rsi(c, 14)
+    kRaw   = ta.stoch(rsi1, rsi1, rsi1, 14)
+    stochK = ta.sma(kRaw, 3)
+    stochD = ta.sma(stochK, 3)
+
+    [macdLine, macdSignal, macdHist] = ta.macd(c, 12, 26, 9)
+
+    longLen     = 25
+    shortLen    = 13
+    sigLen      = 13
+    pc          = ta.change(c)
+    firstSm     = ta.ema(pc, longLen)
+    doublePc    = ta.ema(firstSm, shortLen)
+    doubleAbsPc = ta.ema(ta.ema(math.abs(pc), longLen), shortLen)
+    tsiVal      = doubleAbsPc != 0.0 ? 100.0 * (doublePc / doubleAbsPc) : 0.0
+    tsiSig      = ta.ema(tsiVal, sigLen)
+
+    roc9 = (not na(c[9]) and c[9] != 0.0) ? 100.0 * (c - c[9]) / c[9] : na
+    tsiCorr = ta.correlation(c, bar_index, 14)
+
+    ao = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+
+    chLen   = 9
+    momm    = ta.change(c)
+    m1      = momm >= 0.0 ? momm : 0.0
+    m2      = momm >= 0.0 ? 0.0  : -momm
+    sm1     = math.sum(m1, chLen)
+    sm2     = math.sum(m2, chLen)
+    chandeMO= (sm1 + sm2) != 0.0 ? 100.0 * (sm1 - sm2) / (sm1 + sm2) : 0.0
+
+    lenAdx   = 14
+    upAdx    = ta.change(h)
+    downAdx  = -ta.change(l)
+    plusDM   = na(upAdx)   ? na : (upAdx  > downAdx and upAdx  > 0.0 ? upAdx  : 0.0)
+    minusDM  = na(downAdx) ? na : (downAdx > upAdx  and downAdx > 0.0 ? downAdx : 0.0)
+    trAdx    = math.max(h - l, math.max(math.abs(h - c[1]), math.abs(l - c[1])))
+    trur     = ta.rma(trAdx, lenAdx)
+    diPlus   = fixnan(100.0 * ta.rma(plusDM,  lenAdx) / trur)
+    diMinus  = fixnan(100.0 * ta.rma(minusDM, lenAdx) / trur)
+    sumAdx   = diPlus + diMinus
+    adx14    = 100.0 * ta.rma(math.abs(diPlus - diMinus) / (sumAdx == 0.0 ? 1.0 : sumAdx), lenAdx)
+    diPlus14  = diPlus
+    diMinus14 = diMinus
+
+    mfi14  = ta.mfi(hlc3, 14)
+    lenCmf = 20
+    ad     = c == h and c == l or h == l ? 0.0 : ((2.0 * c - l - h) / (h - l)) * v
+    cmf20  = math.sum(ad, lenCmf) / math.sum(v, lenCmf)
+    obv    = ta.cum(math.sign(ta.change(c)) * v)
+
+    vwapVal = ta.vwap(hlc3)
+
+    upVolBar   = c > c[1] ? v : 0.0
+    downVolBar = c < c[1] ? v : 0.0
+    volDelta   = upVolBar - downVolBar
+
+    [pivD_P, pivD_R1, pivD_R2, pivD_R3, pivD_S1, pivD_S2, pivD_S3] = f_pivFib("D")
+    [piv15_P, piv15_R1, piv15_R2, piv15_R3, piv15_S1, piv15_S2, piv15_S3] = f_pivFib("15")
+    [piv4H_P, piv4H_R1, piv4H_R2, piv4H_R3, piv4H_S1, piv4H_S2, piv4H_S3] = f_pivFib("240")
+    [pivW_P, pivW_R1, pivW_R2, pivW_R3, pivW_S1, pivW_S2, pivW_S3] = f_pivFib("W")
+
+    [np15_val, np15_abs, np15_pct, np15_code] = f_nearestPivot(c, piv15_P, piv15_R1, piv15_R2, piv15_R3, piv15_S1, piv15_S2, piv15_S3)
+    [np4H_val, np4H_abs, np4H_pct, np4H_code] = f_nearestPivot(c, piv4H_P, piv4H_R1, piv4H_R2, piv4H_R3, piv4H_S1, piv4H_S2, piv4H_S3)
+    [npD_val,  npD_abs,  npD_pct,  npD_code ] = f_nearestPivot(c, pivD_P,  pivD_R1,  pivD_R2,  pivD_R3,  pivD_S1,  pivD_S2,  pivD_S3)
+
+    string line = str.tostring(tClose)
+    line += sep + str.tostring(tOpen)
+    line += sep + tkid
+    line += sep + tfP
+    line += sep + str.tostring(bi)
+    line += sep + csvnum(o)
+    line += sep + csvnum(h)
+    line += sep + csvnum(l)
+    line += sep + csvnum(c)
+    line += sep + csvnum(v)
+    line += sep + csvnum(hl2v)
+    line += sep + csvnum(ret1)
+    line += sep + (oiHasData ? "1" : "0")
+    line += sep + csvnum(oiBest)
+    line += sep + csvnum(oiRet1)
+    line += sep + csvnum(premIdx)
+    line += sep + csvnum(basis)
+    line += sep + csvnum(basisPct)
+    line += sep + csvnum(oiNotional)
+    line += sep + csvnum(sma20)
+    line += sep + csvnum(ema50)
+    line += sep + csvnum(avgPrice100)
+    line += sep + csvnum(lrMid)
+    line += sep + csvnum(lrSlope)
+    line += sep + csvnum(stLine)
+    line += sep + csvnum(stDir)
+    line += sep + csvnum(atr14)
+    line += sep + csvnum(hv10)
+    line += sep + csvnum(bbBasis)
+    line += sep + csvnum(bbUpper)
+    line += sep + csvnum(bbLower)
+    line += sep + csvnum(kcMa)
+    line += sep + csvnum(kcUpper)
+    line += sep + csvnum(kcLower)
+    line += sep + csvnum(dcUpper)
+    line += sep + csvnum(dcMid)
+    line += sep + csvnum(dcLower)
+    line += sep + csvnum(chop)
+    line += sep + csvnum(rsi14)
+    line += sep + csvnum(stochK)
+    line += sep + csvnum(stochD)
+    line += sep + csvnum(macdLine)
+    line += sep + csvnum(macdSignal)
+    line += sep + csvnum(macdHist)
+    line += sep + csvnum(tsiVal)
+    line += sep + csvnum(tsiSig)
+    line += sep + csvnum(roc9)
+    line += sep + csvnum(tsiCorr)
+    line += sep + csvnum(ao)
+    line += sep + csvnum(chandeMO)
+    line += sep + csvnum(adx14)
+    line += sep + csvnum(diPlus14)
+    line += sep + csvnum(diMinus14)
+    line += sep + csvnum(mfi14)
+    line += sep + csvnum(cmf20)
+    line += sep + csvnum(obv)
+    line += sep + csvnum(vwapVal)
+    line += sep + csvnum(upVolBar)
+    line += sep + csvnum(downVolBar)
+    line += sep + csvnum(volDelta)
+    line += sep + csvnum(pivD_P)
+    line += sep + csvnum(pivD_R1)
+    line += sep + csvnum(pivD_R2)
+    line += sep + csvnum(pivD_R3)
+    line += sep + csvnum(pivD_S1)
+    line += sep + csvnum(pivD_S2)
+    line += sep + csvnum(pivD_S3)
+    line += sep + csvnum(piv15_P)
+    line += sep + csvnum(piv15_R1)
+    line += sep + csvnum(piv15_R2)
+    line += sep + csvnum(piv15_R3)
+    line += sep + csvnum(piv15_S1)
+    line += sep + csvnum(piv15_S2)
+    line += sep + csvnum(piv15_S3)
+    line += sep + csvnum(piv4H_P)
+    line += sep + csvnum(piv4H_R1)
+    line += sep + csvnum(piv4H_R2)
+    line += sep + csvnum(piv4H_R3)
+    line += sep + csvnum(piv4H_S1)
+    line += sep + csvnum(piv4H_S2)
+    line += sep + csvnum(piv4H_S3)
+    line += sep + csvnum(pivW_P)
+    line += sep + csvnum(pivW_R1)
+    line += sep + csvnum(pivW_R2)
+    line += sep + csvnum(pivW_R3)
+    line += sep + csvnum(pivW_S1)
+    line += sep + csvnum(pivW_S2)
+    line += sep + csvnum(pivW_S3)
+    line += sep + csvnum(volUsd)
+    line += sep + csvnum(volUsdSma30)
+    line += sep + csvnum(volUsdSma240)
+    line += sep + csvnum(rvol30)
+    line += sep + csvnum(rvol240)
+    line += sep + csvnum(f_absPctDiff(c, pivD_P))
+    line += sep + csvnum(f_absPctDiff(c, pivD_R1))
+    line += sep + csvnum(f_absPctDiff(c, pivD_R2))
+    line += sep + csvnum(f_absPctDiff(c, pivD_R3))
+    line += sep + csvnum(f_absPctDiff(c, pivD_S1))
+    line += sep + csvnum(f_absPctDiff(c, pivD_S2))
+    line += sep + csvnum(f_absPctDiff(c, pivD_S3))
+    line += sep + csvnum(f_absPctDiff(c, piv15_P))
+    line += sep + csvnum(f_absPctDiff(c, piv15_R1))
+    line += sep + csvnum(f_absPctDiff(c, piv15_R2))
+    line += sep + csvnum(f_absPctDiff(c, piv15_R3))
+    line += sep + csvnum(f_absPctDiff(c, piv15_S1))
+    line += sep + csvnum(f_absPctDiff(c, piv15_S2))
+    line += sep + csvnum(f_absPctDiff(c, piv15_S3))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_P))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_R1))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_R2))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_R3))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_S1))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_S2))
+    line += sep + csvnum(f_absPctDiff(c, piv4H_S3))
+    line += sep + csvnum(npD_val)
+    line += sep + csvnum(npD_abs)
+    line += sep + csvnum(npD_pct)
+    line += sep + npD_code
+    line += sep + csvnum(np15_val)
+    line += sep + csvnum(np15_abs)
+    line += sep + csvnum(np15_pct)
+    line += sep + np15_code
+    line += sep + csvnum(np4H_val)
+    line += sep + csvnum(np4H_abs)
+    line += sep + csvnum(np4H_pct)
+    line += sep + np4H_code
+    line
+
+buildCsvHeader(_sep) =>
+    string h = "t_close_ms"
+    h += _sep + "t_open_ms"
+    h += _sep + "tickerid"
+    h += _sep + "tf"
+    h += _sep + "bar_index"
+    h += _sep + "o"
+    h += _sep + "h"
+    h += _sep + "l"
+    h += _sep + "c"
+    h += _sep + "v"
+    h += _sep + "hl2"
+    h += _sep + "ret1"
+    h += _sep + "oi_has"
+    h += _sep + "oi_close"
+    h += _sep + "oi_ret1"
+    h += _sep + "premium_idx"
+    h += _sep + "basis"
+    h += _sep + "basis_pct"
+    h += _sep + "oi_notional"
+    h += _sep + "sma20"
+    h += _sep + "ema50"
+    h += _sep + "avgPrice100"
+    h += _sep + "lrMid"
+    h += _sep + "lrSlope"
+    h += _sep + "stLine"
+    h += _sep + "stDir"
+    h += _sep + "atr14"
+    h += _sep + "hv10"
+    h += _sep + "bbBasis"
+    h += _sep + "bbUpper"
+    h += _sep + "bbLower"
+    h += _sep + "kcMa"
+    h += _sep + "kcUpper"
+    h += _sep + "kcLower"
+    h += _sep + "dcUpper"
+    h += _sep + "dcMid"
+    h += _sep + "dcLower"
+    h += _sep + "chop"
+    h += _sep + "rsi14"
+    h += _sep + "stochK"
+    h += _sep + "stochD"
+    h += _sep + "macdLine"
+    h += _sep + "macdSignal"
+    h += _sep + "macdHist"
+    h += _sep + "tsiVal"
+    h += _sep + "tsiSig"
+    h += _sep + "roc9"
+    h += _sep + "tsiCorr"
+    h += _sep + "ao"
+    h += _sep + "chandeMO"
+    h += _sep + "adx14"
+    h += _sep + "diPlus14"
+    h += _sep + "diMinus14"
+    h += _sep + "mfi14"
+    h += _sep + "cmf20"
+    h += _sep + "obv"
+    h += _sep + "vwap"
+    h += _sep + "upVolBar"
+    h += _sep + "downVolBar"
+    h += _sep + "volDelta"
+    h += _sep + "pivD_P"
+    h += _sep + "pivD_R1"
+    h += _sep + "pivD_R2"
+    h += _sep + "pivD_R3"
+    h += _sep + "pivD_S1"
+    h += _sep + "pivD_S2"
+    h += _sep + "pivD_S3"
+    h += _sep + "piv15_P"
+    h += _sep + "piv15_R1"
+    h += _sep + "piv15_R2"
+    h += _sep + "piv15_R3"
+    h += _sep + "piv15_S1"
+    h += _sep + "piv15_S2"
+    h += _sep + "piv15_S3"
+    h += _sep + "piv4H_P"
+    h += _sep + "piv4H_R1"
+    h += _sep + "piv4H_R2"
+    h += _sep + "piv4H_R3"
+    h += _sep + "piv4H_S1"
+    h += _sep + "piv4H_S2"
+    h += _sep + "piv4H_S3"
+    h += _sep + "pivW_P"
+    h += _sep + "pivW_R1"
+    h += _sep + "pivW_R2"
+    h += _sep + "pivW_R3"
+    h += _sep + "pivW_S1"
+    h += _sep + "pivW_S2"
+    h += _sep + "pivW_S3"
+    h += _sep + "volUsd"
+    h += _sep + "volUsdSma30"
+    h += _sep + "volUsdSma240"
+    h += _sep + "rvol30"
+    h += _sep + "rvol240"
+    h += _sep + "absPctDiff_D_P"
+    h += _sep + "absPctDiff_D_R1"
+    h += _sep + "absPctDiff_D_R2"
+    h += _sep + "absPctDiff_D_R3"
+    h += _sep + "absPctDiff_D_S1"
+    h += _sep + "absPctDiff_D_S2"
+    h += _sep + "absPctDiff_D_S3"
+    h += _sep + "absPctDiff_15_P"
+    h += _sep + "absPctDiff_15_R1"
+    h += _sep + "absPctDiff_15_R2"
+    h += _sep + "absPctDiff_15_R3"
+    h += _sep + "absPctDiff_15_S1"
+    h += _sep + "absPctDiff_15_S2"
+    h += _sep + "absPctDiff_15_S3"
+    h += _sep + "absPctDiff_4H_P"
+    h += _sep + "absPctDiff_4H_R1"
+    h += _sep + "absPctDiff_4H_R2"
+    h += _sep + "absPctDiff_4H_R3"
+    h += _sep + "absPctDiff_4H_S1"
+    h += _sep + "absPctDiff_4H_S2"
+    h += _sep + "absPctDiff_4H_S3"
+    h += _sep + "npD_val"
+    h += _sep + "npD_abs"
+    h += _sep + "npD_pct"
+    h += _sep + "npD_code"
+    h += _sep + "np15_val"
+    h += _sep + "np15_abs"
+    h += _sep + "np15_pct"
+    h += _sep + "np15_code"
+    h += _sep + "np4H_val"
+    h += _sep + "np4H_abs"
+    h += _sep + "np4H_pct"
+    h += _sep + "np4H_code"
+    h
+
+buildCsvColCount(_sep) =>
+    array.size(str.split(buildCsvHeader(_sep), _sep))
+
+string csvLineSeries = buildLine()
+
+//───────────────────────────────────────────────────────────────────────────
+// 5 · EVAL parent tracking
+//───────────────────────────────────────────────────────────────────────────
+var arr_uid    = array.new_string()
+var arr_tclose = array.new_int()
+var arr_bar    = array.new_int()
+
+pushEvalParent(_uid, _tclose, _bar) =>
+    if array.size(arr_uid) >= maxPendingEvals
+        array.shift(arr_uid)
+        array.shift(arr_tclose)
+        array.shift(arr_bar)
+    array.push(arr_uid, _uid)
+    array.push(arr_tclose, _tclose)
+    array.push(arr_bar, _bar)
+
+//───────────────────────────────────────────────────────────────────────────
+// 6 · CONFIG / BAR / EVAL payloads (NO secrets in body; URL should carry ?secret=...)
+//───────────────────────────────────────────────────────────────────────────
+buildConfigPayload(_uid, _seq, _t_subject_ms, _t_event_ms, _emit_reason) =>
+    string p = "{"
+    p += "\"row_type\":\"CONFIG\""
+    p += ",\"schema_version\":" + jnum(SCHEMA_VERSION_INT)
+    p += ",\"log_tag\":" + jstrE(LOG_TAG)
+    p += ",\"producer\":" + jstrE(PRODUCER)
+    p += ",\"producer_version\":" + jstrE(PRODUCER_VERSION)
+    p += ",\"uid\":" + jstrE(_uid)
+    p += ",\"dedup\":" + jstrE(_uid)
+    p += ",\"seq\":" + jnum(_seq)
+    p += ",\"run_id\":" + jstrE(run_id)
+    p += ",\"cfg_sig\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_raw\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_full\":" + jstrE(cfg_sig_full)
+    p += ",\"t_subject_ms\":" + jnum(_t_subject_ms)
+    p += ",\"t_event_ms\":" + jnum(_t_event_ms)
+    p += ",\"producer_latency_ms\":" + jnum(_t_event_ms >= _t_subject_ms ? (_t_event_ms - _t_subject_ms) : 0)
+    p += ",\"time_basis\":" + jstrE("bar_close")
+    p += ",\"emit_reason\":" + jstrE(_emit_reason)
+    p += ",\"emit_mode\":" + jstrE(emitMode)
+    p += ",\"mode_json\":" + jbool(MODE_JSON)
+    p += ",\"mode_csv\":" + jbool(MODE_CSV)
+    p += ",\"enable_logging\":" + jbool(enableLogging)
+    p += ",\"include_csv_in_json\":" + jbool(includeCsvInJson)
+    p += ",\"emit_config_on_change\":" + jbool(emitConfigOnChange)
+    p += ",\"config_beacon_every_bars\":" + jnum(configBeaconEveryBars)
+    p += ",\"emit_csv_header_line\":" + jbool(emitCsvHeaderLine)
+    p += ",\"enable_eval_horizon\":" + jbool(enableEvalHorizon)
+    p += ",\"eval_w1\":" + jnum(evalW1)
+    p += ",\"eval_w2\":" + jnum(evalW2)
+    p += ",\"eval_w3\":" + jnum(evalW3)
+    p += ",\"max_pending_evals\":" + jnum(maxPendingEvals)
+    p += ",\"use_log_date_filter\":" + jbool(useLogDateFilter)
+    p += ",\"log_start_date_ms\":" + jnum(logStartDate)
+    p += ",\"exp_id\":" + jstrE(expId)
+    p += ",\"exp_note\":" + jstrE(expNoteSafe)
+    p += ",\"in_log_window\":" + jbool(inLogWindow)
+    p += ",\"exchange\":" + jstrE(exchangeId)
+    p += ",\"symbol\":" + jstrE(symbolId)
+    p += ",\"instrument_type\":" + jstrE(instrumentType)
+    p += ",\"tickerid\":" + jstrE(syminfo.tickerid)
+    p += ",\"tf\":" + jstrE(timeframe.period)
+    p += ",\"tf_sec\":" + jnum(f_tf_seconds_from_period(timeframe.period))
+    p += ",\"json_schema_version\":" + jstrE(jsonSchemaVersion)
+    p += ",\"wide_schema_version\":" + jstrE(schemaVersion)
+    p += ",\"csv_schema_version\":" + jstrE(csvSchemaVersion)
+    p += ",\"env\":" + jstrE(envId)
+    p += ",\"deployment_id\":" + jstrE(deploymentId)
+    p += ",\"timezone_id\":" + jstrE(timezoneId)
+    p += ",\"schema_registry_version\":" + jstrE(schemaRegVer)
+    p += ",\"schema_registry_hash\":" + jstrE(schemaRegHash)
+    p += ",\"script_id\":" + jstrE(scriptId)
+    p += ",\"script_sha\":" + jstrE(scriptSha)
+    p += ",\"universe_id\":" + jstrE(universeId)
+    p += ",\"alert_tag\":" + jstrE(alertTag)
+    p += ",\"price_quote\":" + jstrE(priceQuote)
+    p += ",\"contracts_def\":" + jstrE(contractsDef)
+    p += ",\"sep\":" + jstrE(sep)
+    p += ",\"spot_override\":" + jstrE(spotOverride)
+    p += ",\"premium_override\":" + jstrE(premiumOverride)
+    p += ",\"enable_derivs_req\":" + jbool(enableDerivsReq)
+    p += ",\"use_chart_sym_req\":" + jbool(useChartSymReq)
+    p += ",\"sym_primary_req\":" + jstrE(str.tostring(symPrimaryReqIn))
+    p += ",\"sym_fallback_req\":" + jstrE(str.tostring(symFallbackReq))
+    p += ",\"req_gaps\":" + jbool(reqGaps)
+    p += ",\"req_repaint\":" + jbool(reqRepaint)
+    p += ",\"oi_fail_hard\":" + jbool(oiFailHardReq)
+    p += ",\"csv_col_count\":" + jnum(buildCsvColCount(sep))
+    // Optional csv_header can push CONFIG over TradingView alert-size caps; omit if it would exceed TV_MAX_PAYLOAD_CHARS.
+    if includeCsvHeaderInConfig
+        string p2 = p + ",\"csv_header\":" + jstrE(buildCsvHeader(sep)) + "}"
+        p := str.length(p2) <= TV_MAX_PAYLOAD_CHARS ? p2 : (p + "}")
+    else
+        p += "}"
+    p
+
+buildBarPayload(_uid, _dedup, _seq, _t_open_ms, _t_close_ms, _t_event_ms, _tf_str, _tf_sec, _tickerid, _include_csv, _csvLine, _event_type) =>
+    bool spot_has    = not na(spotCloseSeries)
+    bool premium_has = not na(premIdxSeries)
+
+    // NOTE: Do NOT call request.*() inside this payload builder.
+    // All Request-library metrics are computed in the canonical series block (Section 3),
+    // so their contexts are established on historical bars (realtime-safe).
+    string symP  = f_req_primary_sym()
+    string symF  = symFallbackReq
+
+    float ls_ratio_accounts = enableDerivsReq ? lsRatioAccountsBest : na
+    bool  ls_used_fallback  = enableDerivsReq ? lsRatioAccountsUsedFallbackBest : false
+
+    float long_accounts = enableDerivsReq ? longAccountsBest : na
+    bool  long_used_fallback = enableDerivsReq ? longAccountsUsedFallbackBest : false
+
+    float short_accounts = enableDerivsReq ? shortAccountsBest : na
+    bool  short_used_fallback = enableDerivsReq ? shortAccountsUsedFallbackBest : false
+
+    float liq_buy = enableDerivsReq ? liqBuyBest : na
+    bool  liq_buy_used_fallback = enableDerivsReq ? liqBuyUsedFallbackBest : false
+
+    float liq_sell = enableDerivsReq ? liqSellBest : na
+    bool  liq_sell_used_fallback = enableDerivsReq ? liqSellUsedFallbackBest : false
+
+    string funding_sym_used = enableDerivsReq ? fundingSymUsedBest : ""
+    float  funding_rate = enableDerivsReq ? fundingRateBest : na
+    bool   funding_used_fallback = enableDerivsReq ? fundingUsedFallbackBest : false
+    string funding_units = fundingUnits
+
+    float oi_close = oiBestSeries
+    bool  oi_has   = not na(oi_close)
+    if enableDerivsReq and oiFailHardReq and na(oi_close)
+        runtime.error(str.format("Request OI missing (oi_close is na) for `{0}` (primary/fallback).", _tickerid))
+
+    float spotClose = spotCloseSeries
+    float premIdx   = premIdxSeries
+    float basis     = na(spotClose) ? na : (close - spotClose)
+    float basisPct  = na(spotClose) ? na : (basis / spotClose)
+    float premiumPct = na(premIdx) ? na : premIdx * 0.01
+
+    float ret1_ = (not na(close[1]) and close[1] != 0.0) ? (close - close[1]) / close[1] : na
+
+    string p = "{"
+    p += "\"row_type\":\"BAR\""
+    p += ",\"schema_version\":" + jnum(SCHEMA_VERSION_INT)
+    p += ",\"log_tag\":" + jstrE(LOG_TAG)
+    p += ",\"producer\":" + jstrE(PRODUCER)
+    p += ",\"producer_version\":" + jstrE(PRODUCER_VERSION)
+    p += ",\"event_type\":" + jstrE(_event_type)
+    p += ",\"json_schema_version\":" + jstrE(jsonSchemaVersion)
+    p += ",\"wide_schema_version\":" + jstrE(schemaVersion)
+    p += ",\"csv_schema_version\":" + jstrE(csvSchemaVersion)
+    p += ",\"env\":" + jstrE(envId)
+    p += ",\"deployment_id\":" + jstrE(deploymentId)
+    p += ",\"timezone_id\":" + jstrE(timezoneId)
+    p += ",\"schema_registry_version\":" + jstrE(schemaRegVer)
+    p += ",\"schema_registry_hash\":" + jstrE(schemaRegHash)
+    p += ",\"script_id\":" + jstrE(scriptId)
+    p += ",\"script_sha\":" + jstrE(scriptSha)
+    p += ",\"universe_id\":" + jstrE(universeId)
+    p += ",\"alert_tag\":" + jstrE(alertTag)
+    p += ",\"run_id\":" + jstrE(run_id)
+    p += ",\"cfg_sig\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_raw\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_full\":" + jstrE(cfg_sig_full)
+    p += ",\"uid\":" + jstrE(_uid)
+    p += ",\"dedup\":" + jstrE(_dedup)
+    p += ",\"seq\":" + jnum(_seq)
+    p += ",\"exchange\":" + jstrE(exchangeId)
+    p += ",\"symbol\":" + jstrE(symbolId)
+    p += ",\"instrument_type\":" + jstrE(instrumentType)
+    p += ",\"tickerid\":" + jstrE(_tickerid)
+    p += ",\"tf\":" + jstrE(_tf_str)
+    p += ",\"tf_sec\":" + jnum(_tf_sec)
+    p += ",\"bar_index\":" + jnum(bar_index)
+    p += ",\"t_subject_ms\":" + jnum(_t_close_ms)
+    p += ",\"t_open_ms\":" + jnum(_t_open_ms)
+    p += ",\"t_close_ms\":" + jnum(_t_close_ms)
+    p += ",\"t_event_ms\":" + jnum(_t_event_ms)
+    p += ",\"producer_latency_ms\":" + jnum(_t_event_ms - _t_close_ms)
+    p += ",\"time_basis\":" + jstrE("bar_close")
+    p += ",\"base_tickerid\":" + jstrE(baseTickerId)
+    p += ",\"is_perp\":" + jbool(isPerp)
+    p += ",\"price_quote\":" + jstrE(priceQuote)
+    p += ",\"contracts_def\":" + jstrE(contractsDef)
+    p += ",\"open\":" + jnum(open)
+    p += ",\"high\":" + jnum(high)
+    p += ",\"low\":" + jnum(low)
+    p += ",\"close\":" + jnum(close)
+    p += ",\"volume\":" + jnum(volume)
+    p += ",\"ret1\":" + jnum(ret1_)
+    p += ",\"spot_sym\":" + jstrE(spotSym)
+    p += ",\"spot_has\":" + jbool(spot_has)
+    p += ",\"spot_close\":" + jnum(spotCloseSeries)
+    p += ",\"premium_sym\":" + jstrE(premiumSym)
+    p += ",\"premium_has\":" + jbool(premium_has)
+    p += ",\"premium_idx\":" + jnum(premIdxSeries)
+    p += ",\"basis\":" + jnum(basis)
+    p += ",\"basis_pct\":" + jnum(basisPct)
+    p += ",\"premium_pct\":" + jnum(premiumPct)
+    p += ",\"enable_derivs_req\":" + jbool(enableDerivsReq)
+    p += ",\"req_primary\":" + jstrE(str.tostring(symP))
+    p += ",\"req_fallback\":" + jstrE(str.tostring(symF))
+    p += ",\"req_gaps\":" + jbool(reqGaps)
+    p += ",\"req_repaint\":" + jbool(reqRepaint)
+    p += ",\"oi_source\":" + jstrE("TV_Request_openInterestCrypto_close")
+    p += ",\"oi_close\":" + jnum(oi_close)
+    p += ",\"oi_has\":" + jbool(oi_has)
+    p += ",\"oi_used_fallback\":" + jbool(oiBestUsedFallback)
+    p += ",\"oi_notional\":" + jnum(oi_has ? (oi_close * close) : na)
+    p += ",\"funding_units\":" + jstrE(funding_units)
+    p += ",\"funding_rate\":" + jnum(funding_rate)
+    p += ",\"funding_has\":" + jbool(not na(funding_rate))
+    p += ",\"funding_used_fallback\":" + jbool(funding_used_fallback)
+    p += ",\"funding_sym_used\":" + jstrE(funding_sym_used)
+    p += ",\"ls_ratio_accounts\":" + jnum(ls_ratio_accounts)
+    p += ",\"ls_has\":" + jbool(not na(ls_ratio_accounts))
+    p += ",\"ls_used_fallback\":" + jbool(ls_used_fallback)
+    p += ",\"long_accounts\":" + jnum(long_accounts)
+    p += ",\"long_has\":" + jbool(not na(long_accounts))
+    p += ",\"long_used_fallback\":" + jbool(long_used_fallback)
+    p += ",\"short_accounts\":" + jnum(short_accounts)
+    p += ",\"short_has\":" + jbool(not na(short_accounts))
+    p += ",\"short_used_fallback\":" + jbool(short_used_fallback)
+    p += ",\"liq_buy\":" + jnum(liq_buy)
+    p += ",\"liq_buy_has\":" + jbool(not na(liq_buy))
+    p += ",\"liq_buy_used_fallback\":" + jbool(liq_buy_used_fallback)
+    p += ",\"liq_sell\":" + jnum(liq_sell)
+    p += ",\"liq_sell_has\":" + jbool(not na(liq_sell))
+    p += ",\"liq_sell_used_fallback\":" + jbool(liq_sell_used_fallback)
+    p += ",\"liq_has\":" + jbool(not na(liq_buy) or not na(liq_sell))
+    p += ",\"exp_id\":" + jstrE(expId)
+    string out = p + "}"
+    // Optional csv field can push BAR over TradingView alert-size caps; omit if it would exceed TV_MAX_PAYLOAD_CHARS.
+    if _include_csv
+        string p2 = p + ",\"csv\":" + jstrE(_csvLine) + "}"
+        out := str.length(p2) <= TV_MAX_PAYLOAD_CHARS ? p2 : out
+    out
+
+int lenW1 = evalW1 + 1
+int lenW2 = evalW2 + 1
+int lenW3 = evalW3 + 1
+
+float eval_wh1 = ta.highest(high, lenW1)
+float eval_wl1 = ta.lowest(low, lenW1)
+int   eval_hb1 = ta.highestbars(high, lenW1)
+int   eval_lb1 = ta.lowestbars(low, lenW1)
+int   eval_bth1 = evalW1 - eval_hb1
+int   eval_btl1 = evalW1 - eval_lb1
+
+float eval_wh2 = ta.highest(high, lenW2)
+float eval_wl2 = ta.lowest(low, lenW2)
+int   eval_hb2 = ta.highestbars(high, lenW2)
+int   eval_lb2 = ta.lowestbars(low, lenW2)
+int   eval_bth2 = evalW2 - eval_hb2
+int   eval_btl2 = evalW2 - eval_lb2
+
+float eval_wh3 = ta.highest(high, lenW3)
+float eval_wl3 = ta.lowest(low, lenW3)
+int   eval_hb3 = ta.highestbars(high, lenW3)
+int   eval_lb3 = ta.lowestbars(low, lenW3)
+int   eval_bth3 = evalW3 - eval_hb3
+int   eval_btl3 = evalW3 - eval_lb3
+
+float atr14_eval_series = ta.atr(14)
+
+buildEvalPayload(_uid_eval, _seq, _parent_uid, _parent_t_close_ms, _W, _wh, _wl, _bth, _btl, _close_eval, _atr14_eval, _t_eval_close_ms, _t_event_ms) =>
+    string p = "{"
+    p += "\"row_type\":\"EVAL\""
+    p += ",\"schema_version\":" + jnum(SCHEMA_VERSION_INT)
+    p += ",\"log_tag\":" + jstrE(LOG_TAG)
+    p += ",\"producer\":" + jstrE(PRODUCER)
+    p += ",\"producer_version\":" + jstrE(PRODUCER_VERSION)
+    p += ",\"event_type\":\"B1M_EVAL\""
+    p += ",\"json_schema_version\":" + jstrE(jsonSchemaVersion)
+    p += ",\"wide_schema_version\":" + jstrE(schemaVersion)
+    p += ",\"csv_schema_version\":" + jstrE(csvSchemaVersion)
+    p += ",\"env\":" + jstrE(envId)
+    p += ",\"deployment_id\":" + jstrE(deploymentId)
+    p += ",\"timezone_id\":" + jstrE(timezoneId)
+    p += ",\"schema_registry_version\":" + jstrE(schemaRegVer)
+    p += ",\"schema_registry_hash\":" + jstrE(schemaRegHash)
+    p += ",\"script_id\":" + jstrE(scriptId)
+    p += ",\"script_sha\":" + jstrE(scriptSha)
+    p += ",\"universe_id\":" + jstrE(universeId)
+    p += ",\"alert_tag\":" + jstrE(alertTag)
+    p += ",\"run_id\":" + jstrE(run_id)
+    p += ",\"cfg_sig\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_raw\":" + jstrE(cfg_sig)
+    p += ",\"cfg_sig_full\":" + jstrE(cfg_sig_full)
+    p += ",\"uid\":" + jstrE(_uid_eval)
+    p += ",\"dedup\":" + jstrE(_uid_eval)
+    p += ",\"parent_uid\":" + jstrE(_parent_uid)
+    p += ",\"seq\":" + jnum(_seq)
+    p += ",\"exchange\":" + jstrE(exchangeId)
+    p += ",\"symbol\":" + jstrE(symbolId)
+    p += ",\"instrument_type\":" + jstrE(instrumentType)
+    p += ",\"tickerid\":" + jstrE(syminfo.tickerid)
+    p += ",\"tf\":" + jstrE(timeframe.period)
+    p += ",\"tf_sec\":" + jnum(f_tf_seconds_from_period(timeframe.period))
+    p += ",\"bar_index\":" + jnum(bar_index)
+    p += ",\"t_subject_ms\":" + jnum(_parent_t_close_ms)
+    p += ",\"t_eval_close_ms\":" + jnum(_t_eval_close_ms)
+    p += ",\"t_event_ms\":" + jnum(_t_event_ms)
+    p += ",\"producer_latency_ms\":" + jnum(_t_event_ms - _t_eval_close_ms)
+    p += ",\"time_basis\":" + jstrE("bar_close")
+    p += ",\"W\":" + jnum(_W)
+    p += ",\"windowHigh\":" + jnum(_wh)
+    p += ",\"windowLow\":" + jnum(_wl)
+    p += ",\"barsToHigh\":" + jnum(_bth)
+    p += ",\"barsToLow\":" + jnum(_btl)
+    p += ",\"close_eval\":" + jnum(_close_eval)
+    p += ",\"atr14_eval\":" + jnum(_atr14_eval)
+    p += "}"
+    p
+
+//───────────────────────────────────────────────────────────────────────────
+// 7 · Main emits (DB-first)
+//
+// Key shift vs the Google Sheets era:
+//   • We send exactly ONE alert() per confirmed realtime bar close.
+//   • That single webhook payload can contain multiple logical records (CONFIG + BAR + 0..N EVAL).
+//   • This avoids TradingView "one alert per bar close" suppression and permanently fixes the
+//     CONFIG-bar issue without sacrificing BAR telemetry.
+//───────────────────────────────────────────────────────────────────────────
+
+// One-time hard guards (fail-closed in prod)
+if barstate.isfirst
+    if envId == "prod" and str.length(schemaRegHash) != 64
+        runtime.error("schema_registry_hash must be set to a 64-char sha256 hex string when envId=prod")
+    if enableEvalHorizon and emitMode != "BUNDLE_JSON"
+        runtime.error("enableEvalHorizon requires emitMode=BUNDLE_JSON (EVAL emits are bundled to avoid alert() suppression)")
+
+// Bundle wrapper (receiver should iterate records[] transactionally)
+buildBundlePayload(_records_json) =>
+    string b = "{"
+    b += "\"bundle_version\":1"
+    b += ",\"bundle_type\":\"TV_ALERT_BUNDLE\""
+    b += ",\"sent_at_ms\":" + jnum(timenow)
+    b += ",\"records\":[" + _records_json + "]"
+    b += "}"
+    b
+
+// Decide whether to include a CONFIG record in this bundle
+shouldEmitConfig(_rt_bar_num) =>
+    bool want = false
+    string reason = ""
+    if MODE_JSON and emitConfigOnChange
+        bool want_first  = (not config_sent)
+        bool want_warmup = (warmup_left > 0)
+        bool want_change = cfg_changed
+        bool want_beacon = (configBeaconEveryBars > 0) and (_rt_bar_num > 0) and ((_rt_bar_num % configBeaconEveryBars) == 0)
+
+        if want_first
+            want := true
+            reason := "FIRST_EMIT"
+        if want_warmup
+            want := true
+            reason := "WARMUP_" + str.tostring(warmup_left)
+        if want_change
+            want := true
+            reason := "CFG_CHANGED"
+        if want_beacon
+            want := true
+            reason := "BEACON"
+    [want, reason]
+
+// Emit on confirmed realtime bar close only
+if meta_ok()
+    int rt_bar_num = run_rt_bar_count + 1
+
+    // If cfg changed since last confirmed bar, require a new CONFIG send (and warmup again)
+    if cfg_changed
+        config_sent := false
+        warmup_left := (MODE_JSON and configWarmupBars > 0) ? configWarmupBars : 0
+
+    // Legacy CSV mode (kept for debugging only; DB-first should use JSON/BUNDLE_JSON)
+    if MODE_CSV and data_ok()
+        if emitCsvHeaderLine and barstate.isnew
+            alert(buildCsvHeader(sep), alert.freq_once_per_bar_close)
+        else
+            alert(csvLineSeries, alert.freq_once_per_bar_close)
+
+    // JSON modes (BUNDLE_JSON strongly recommended)
+    if MODE_JSON
+        bool want_bar = data_ok()
+        [want_cfg, cfg_reason] = shouldEmitConfig(rt_bar_num)
+
+        // IDs
+        string bar_uid   = make_bar_uid()
+        string bar_dedup = bar_uid
+        string bar_evt   = reqGaps ? "B1M_BAR_REQ_GAP" : "B1M_BAR"
+        string cfg_uid   = "CONFIG|" + run_id + "|" + cfg_sig
+
+        // 1) CONFIG record (bundled)
+        string cfg_rec = ""
+        if MODE_BUNDLE_JSON and want_cfg
+            seq += 1
+            cfg_rec := buildConfigPayload(cfg_uid, seq, time_close, timenow, cfg_reason)
+            config_sent := true
+            warmup_left := (warmup_left > 0) ? (warmup_left - 1) : 0
+
+        // 2) BAR record
+        string bar_rec = ""
+        int bar_seq = na
+        bool bar_has_csv = false
+        if want_bar
+            bar_has_csv := includeCsvInJson
+            seq += 1
+            bar_seq := seq
+            bar_rec := buildBarPayload(bar_uid, bar_dedup, bar_seq, time, time_close, timenow,
+                 timeframe.period, timeframe.in_seconds(), syminfo.tickerid, bar_has_csv, csvLineSeries, bar_evt)
+
+        // 3) EVAL records due on this bar (bundle mode only)
+        string eval_recs = ""
+        bool eval_first = true
+        bool can_emit_evals = (MODE_BUNDLE_JSON and enableEvalHorizon and data_ok())
+
+        if can_emit_evals
+            int n = array.size(arr_uid)
+            for i = n - 1 to 0
+                string puid = array.get(arr_uid, i)
+                int pbar = array.get(arr_bar, i)
+                int ptclose = array.get(arr_tclose, i)
+
+                if evalW1 > 0 and bar_index == pbar + evalW1
+                    seq += 1
+                    string uid_eval = "EVAL|" + puid + "|W" + str.tostring(evalW1)
+                    string ep = buildEvalPayload(uid_eval, seq, puid, ptclose, evalW1,
+                         eval_wh1, eval_wl1, eval_bth1, eval_btl1, close, atr14_eval_series, time_close, timenow)
+                    eval_recs := eval_recs + (eval_first ? "" : ",") + ep
+                    eval_first := false
+
+                if evalW2 > 0 and bar_index == pbar + evalW2
+                    seq += 1
+                    string uid_eval = "EVAL|" + puid + "|W" + str.tostring(evalW2)
+                    string ep = buildEvalPayload(uid_eval, seq, puid, ptclose, evalW2,
+                         eval_wh2, eval_wl2, eval_bth2, eval_btl2, close, atr14_eval_series, time_close, timenow)
+                    eval_recs := eval_recs + (eval_first ? "" : ",") + ep
+                    eval_first := false
+
+                if evalW3 > 0 and bar_index == pbar + evalW3
+                    seq += 1
+                    string uid_eval = "EVAL|" + puid + "|W" + str.tostring(evalW3)
+                    string ep = buildEvalPayload(uid_eval, seq, puid, ptclose, evalW3,
+                         eval_wh3, eval_wl3, eval_bth3, eval_btl3, close, atr14_eval_series, time_close, timenow)
+                    eval_recs := eval_recs + (eval_first ? "" : ",") + ep
+                    eval_first := false
+
+                // Expire parents once all horizons are past
+                int maxW = evalW1
+                maxW := evalW2 > maxW ? evalW2 : maxW
+                maxW := evalW3 > maxW ? evalW3 : maxW
+                if maxW > 0 and bar_index > pbar + maxW
+                    array.remove(arr_uid, i)
+                    array.remove(arr_tclose, i)
+                    array.remove(arr_bar, i)
+
+        // Push current BAR as an EVAL parent for future horizons (only if BAR was logged)
+        if MODE_BUNDLE_JSON and enableEvalHorizon and want_bar
+            pushEvalParent(bar_uid, time_close, bar_index)
+
+        bool has_any = (str.length(cfg_rec) > 0) or (str.length(bar_rec) > 0) or (str.length(eval_recs) > 0)
+        if has_any
+            string recs = ""
+            bool first = true
+            if str.length(cfg_rec) > 0
+                recs := recs + (first ? "" : ",") + cfg_rec
+                first := false
+            if str.length(bar_rec) > 0
+                recs := recs + (first ? "" : ",") + bar_rec
+                first := false
+            if str.length(eval_recs) > 0
+                recs := recs + (first ? "" : ",") + eval_recs
+                first := false
+
+            string msg = MODE_BUNDLE_JSON ? buildBundlePayload(recs) : bar_rec
+
+            // Size guard (bundle): if over cap, drop BAR.csv first and retry once.
+            if MODE_BUNDLE_JSON and str.length(msg) > TV_MAX_PAYLOAD_CHARS and want_bar and bar_has_csv and not na(bar_seq)
+                bar_rec := buildBarPayload(bar_uid, bar_dedup, bar_seq, time, time_close, timenow,
+                     timeframe.period, timeframe.in_seconds(), syminfo.tickerid, false, csvLineSeries, bar_evt)
+
+                // Rejoin
+                recs := ""
+                first := true
+                if str.length(cfg_rec) > 0
+                    recs := recs + (first ? "" : ",") + cfg_rec
+                    first := false
+                if str.length(bar_rec) > 0
+                    recs := recs + (first ? "" : ",") + bar_rec
+                    first := false
+                if str.length(eval_recs) > 0
+                    recs := recs + (first ? "" : ",") + eval_recs
+                    first := false
+
+                msg := buildBundlePayload(recs)
+
+            emitDataAlert(msg)
+
+    run_rt_bar_count += 1
+
+// Update last_cfg_sig on confirmed bars (for cfg_changed detection)
+if barstate.isconfirmed and cfg_changed
+    last_cfg_sig := cfg_sig

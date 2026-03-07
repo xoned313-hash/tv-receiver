@@ -1,0 +1,328 @@
+P1.2 — Audit‑Grade Telemetry Ledger Contract (TV Receiver + MCP + GitHub Integrated)
+Version: 2.4-draft.0
+Last updated: 2026-02-21
+Default timezone: America/Detroit (ET)
+Normative keywords: MUST / MUST NOT / SHOULD / MAY (RFC-style)
+
+1) Purpose (non‑negotiable)
+This contract governs a production-grade telemetry ledger for trading research and (later) automation:
+  Producers (TradingView Pine) -> Ingress Receiver (tv-receiver) -> Immutable RAW spine -> Deterministic materializer
+  -> QA gates + replay proofs -> Derived tables -> Reports/analysis (human or LLM) -> (optional execution, separately gated).
+
+The system is designed to:
+  • Preserve evidence (lossless where feasible).
+  • Make ambiguity explicit (no “interpretation by vibes”).
+  • Support deterministic replay and audit.
+  • Scale toward automation without increasing operational risk.
+
+2) Precedence + single source of truth
+REQ-PREC-001: The order of precedence is:
+  (1) This Contract
+  (2) Versioned artifacts referenced by this Contract (schema registry, QA gate spec, golden vectors)
+  (3) Runbooks / Plan of Action
+  (4) Implementation (code), which MUST conform upward.
+
+REQ-PREC-002: If any two sources conflict, apply the strictest interpretation that preserves auditability.
+If ambiguity remains, open CHANGE_CONTROL and treat it as an explicit design decision (no silent choosing).
+
+3) Definitions
+• INTERNAL data: user-provided uploads, DB tables populated by this system, and tool outputs (MCP queries).
+• EXTERNAL data: web/news/sentiment. EXTERNAL MUST NOT be used to fill INTERNAL gaps for tradable outputs.
+• “Tradable” output: any analysis implying a concrete trade, sizing, or execution direction.
+
+4) Security + privacy (no corners)
+REQ-SEC-001 (Transport TLS): All DB connections MUST use TLS verification with a trusted CA chain.
+  • MUST use DATABASE_CA_CERT (or equivalent) with rejectUnauthorized=true (Node) / sslmode=verify-full (psycopg).
+  • MUST NOT use NODE_TLS_REJECT_UNAUTHORIZED=0 in production or shared environments.
+
+REQ-SEC-002 (Secret transport): Producer authentication secret MUST be transported via:
+  • URL query parameter ?secret=... (TradingView-compatible) OR an authenticated header if the producer is fully controlled.
+  • Secrets MUST NOT appear in JSON bodies.
+
+REQ-SEC-003 (Redaction): Receiver MUST redact token-like fields before storage and hashing.
+  Minimum key blacklist (case-insensitive): secret, webhook_secret, token, authorization, api_key, password.
+  Redaction MUST occur BEFORE computing payload_sha256.
+
+REQ-SEC-004 (Privacy posture): Receiver MUST NOT store raw source IP in DB.
+  • Store ip_hash (sha256 of canonical IP string) and optionally user_agent_hash.
+  • Raw request metadata MAY be stored only in transient logs with bounded retention (<= 14 days) and MUST be excluded from DB.
+
+REQ-SEC-005 (Least privilege DB users):
+  • Receiver uses an INSERT-only role (plus SELECT for schema bootstrap checks if required).
+  • MCP server uses a read-only role (SELECT only).
+  • Materializer uses a role with controlled write privileges to derived tables only.
+
+REQ-SEC-006 (MCP exposure): If MCP is internet-reachable, it MUST have authentication AND be least-privilege.
+  If auth cannot be enabled immediately, MCP MUST be treated as DEV-only:
+    - read-only DB role
+    - minimal tools
+    - network restricted (allowlist / private ingress) where possible
+    - explicit PROVISIONAL labeling in ops docs.
+
+5) Audit spine: required common fields on every record
+REQ-SPINE-001: Every logical record (CONFIG/BAR/EVAL/...) stored in the RAW spine MUST contain:
+
+Common identity:
+  • row_type (enum)
+  • uid (globally unique string)
+  • parent_uid (nullable; required for dependent types)
+  • run_id (string)
+  • cfg_sig (canonical config signature)
+  • schema_version (int)
+  • schema_registry_hash (string; 64-hex sha256)
+  • producer_id (enum: A1M, B1M, ENRICHER, MATERIALIZER, QA_ENGINE, REPLAYER, INGRESS)
+  • deployment_id (string)
+  • env (enum: prod, staging, dev)
+  • exchange (string)
+  • symbol (string)
+  • tickerid (string)
+  • instrument_type (string)
+  • tf (string)
+  • tf_sec (int)
+  • seq (monotonic int64 per run_id; (run_id, seq) unique)
+
+Time semantics:
+  • t_subject_ms, t_event_ms, t_received_ms (int64)
+  • latency_ms = t_received_ms - t_event_ms
+  • t_subject_iso, t_event_iso (ISO8601)
+  • timezone (IANA name, e.g., America/Detroit)
+  • day_id_utc (YYYY-MM-DD)
+  • day_id_local (YYYY-MM-DD)
+  • session_id (explicit; default: UTC_DAY_YYYY-MM-DD)
+
+Ingest integrity:
+  • auth_ok (bool)
+  • parse_ok (bool)
+  • schema_match_ok (bool)
+  • unknown_keys_count (int)
+  • missing_required_count (int)
+  • payload_sha256 (sha256 of redacted payload)
+  • payload_size_bytes (int)
+
+Recommended optional spine fields:
+  • request_id (unique per HTTP request)
+  • ip_hash (sha256 hex; privacy-preserving)
+  • user_agent_hash (sha256 hex)
+  • script_sha (producer code hash; REQUIRED when env=prod)
+  • notes (bounded length)
+
+REQ-SPINE-002 (Hard invariant): If auth_ok=false, the stored record MUST be row_type=INGRESS_REJECT or row_type=ERROR.
+No silent drops.
+
+6) Producer contract (TradingView Pine / B1M)
+REQ-PROD-001: TradingView alert setup MUST use:
+  • Condition: Any alert() function call
+  • Webhook URL: https://<INGRESS_HOST>/tv?secret=<WEBHOOK_SECRET>
+  • Message: {message} exactly
+  • Frequency: Once per bar close
+
+REQ-PROD-002: BUNDLE_JSON mode is the preferred producer format.
+Receiver MUST support both:
+  • Bundle wrapper: { bundle_version, bundle_type, sent_at_ms, records[] }
+  • Single-record JSON (legacy)
+
+REQ-PROD-003: In env=prod, producer MUST emit:
+  • schema_registry_hash length=64 hex
+  • script_sha non-empty
+  • CONFIG emission must be guaranteed (first + change + beacon/warmup rules)
+
+7) Ingress receiver contract (tv-receiver)
+REQ-ING-001 (Endpoints): Receiver MUST accept:
+  • POST /tv (TradingView)
+  • POST /webhook (optional alias)
+  • GET /healthz (status + counts; no secrets leaked)
+
+REQ-ING-002 (Auth): Receiver MUST validate secret from query string.
+  • If WEBHOOK_SECRET is missing, receiver MUST fail closed (5xx misconfigured) rather than accept unauthenticated data.
+
+REQ-ING-003 (Always record failures): Auth failures, parse failures, and schema mismatches MUST be persisted as
+  INGRESS_REJECT or ERROR records (not silently dropped).
+  NOTE: If payload lacks run_id, receiver MUST use a sentinel run_id (RUN_UNKNOWN) and create a corresponding runs row.
+
+REQ-ING-004 (Idempotency): Receiver MUST be idempotent.
+  • Primary key uid ensures dedupe.
+  • (run_id, seq) MUST be unique; duplicates MUST create DUPLICATE row_type records OR be logged as duplicates with explicit counters.
+
+REQ-ING-005 (No implicit schema): Receiver MUST enforce minimal required keys by row_type (CONFIG/BAR/EVAL/etc).
+  • missing_required_count and schema_match_ok MUST be computed (not hardcoded).
+
+REQ-ING-006 (No raw IP): Receiver MUST compute ip_hash and user_agent_hash and MUST NOT store raw IP.
+
+8) Database schema (core, contract-corrected)
+This section provides the minimum schema to run ingestion safely and auditably.
+You MAY extend tables, but MUST NOT remove required fields without CHANGE_CONTROL.
+
+REQ-DB-001 (Enums): The DB MUST define env_t, producer_t, row_type_t enums.
+
+REQ-DB-002 (Runs registry): runs table MUST exist and receiver MUST upsert into it per run_id.
+
+REQ-DB-003 (RAW spine): raw_events MUST be append-only and include all fields listed in §5.
+
+Appendix A includes a ready-to-run SQL migration for these core tables.
+
+9) Deterministic materialization + QA gates (no automation without gates)
+REQ-QA-001 (CONFIG coverage): No BAR/EVAL/DECISION is eligible for tradable analytics unless matching CONFIG exists.
+If missing, records MUST be quarantined or explicitly flagged and excluded.
+
+REQ-QA-002 (Prod provenance): For env=prod, script_sha MUST be non-empty; otherwise QA_AUDIT + quarantine.
+
+REQ-QA-003 (Conformance report): Every export (CSV/Sheets/Parquet) MUST include a deterministic conformance report:
+  coverage, missingness, config coverage, gap checks, schema drift, unit checks.
+
+REQ-REPLAY-001: The system MUST support deterministic replay from RAW to derived tables with mismatch reporting.
+
+10) LLM / analyst output contract (Jane Street-style)
+REQ-OUT-001 (Output status taxonomy): Every response that proposes trades MUST declare:
+  • APPROVED (prod-tradable): all P0 gates pass.
+  • PROVISIONAL (research-only): computable, but one or more P0 provenance gates fail.
+  • BLOCKED: missing trading-critical inputs required to compute defensible results.
+
+REQ-OUT-002 (Mandatory structure): For trade/market analysis, the operator MUST output:
+  1) Output Status
+  2) QA Summary (clean/broken/excluded)
+  3) Evidence (computed facts; numbers)
+  4) Market Dynamics Snapshot (3–6 bullets)
+  5) Global Market Outlook (INTERNAL first; EXTERNAL labeled; EXTERNAL never overrides INTERNAL gaps)
+  6) Scenarios (2–4) with triggers
+  7) Levels (method + lookback explicit)
+  8) Invalidation
+  9) IF/THEN Rules
+ 10) Risk (sizing + exposure caps)
+ 11) Not Jane Street Yet — Gap Ledger
+ 12) Top‑3 Trade Slate (three slots; each APPROVED/PROVISIONAL/BLOCKED with unblocks)
+
+REQ-OUT-003 (No invented data): Tickers/levels/stops/targets MUST be derived from INTERNAL data or explicitly provided by the user.
+
+11) Change control + artifacts (PhD-grade reproducibility)
+REQ-CC-001: Any change that affects data meaning MUST produce a CHANGE_CONTROL entry including:
+  • what changed, why, who, timestamp
+  • affected components (producer/receiver/materializer/QA)
+  • forward impact + backfill/replay instructions
+  • acceptance tests executed and their outputs
+
+REQ-ART-001 (Append-only artifacts): Versioned artifacts MUST be append-only (never overwritten):
+  schema registry, QA gate spec, golden vectors, replay reports, conformance reports.
+
+12) Acceptance (definition of “up and running”)
+The system is considered “up and running” only when ALL are true:
+  • Receiver passes TLS verification to DB (no insecure bypass).
+  • Receiver stores RAW records idempotently and losslessly (redacted + hashed).
+  • Auth failures are recorded (not dropped).
+  • CONFIG coverage gate is enforced (quarantine not silent).
+  • MCP DB app can run read-only health + table introspection safely (read-only user + auth or DEV-only restrictions documented).
+  • GitHub repo contains contract + runbooks + migrations and is the canonical source of truth.
+
+APPENDIX A — Core migration SQL (core enums + runs + raw_events)
+(Keep this appendix synchronized with the actual migrations committed in GitHub. If they differ, the repo migration wins and this appendix must be updated via CHANGE_CONTROL.)
+
+-- Core schema migration: P1.2 v2.4 (receiver + RAW spine)
+-- Safe to run multiple times (uses IF NOT EXISTS where possible).
+-- IMPORTANT: Run this as a privileged DB user once. Receiver should not own migrations.
+
+BEGIN;
+
+-- Optional but recommended for hashing helpers (if you later want pg-side hashing)
+-- CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+DO $$ BEGIN
+  CREATE TYPE env_t AS ENUM ('prod','staging','dev');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE producer_t AS ENUM ('A1M','B1M','ENRICHER','MATERIALIZER','QA_ENGINE','REPLAYER','INGRESS');
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE row_type_t AS ENUM (
+    'CONFIG','BAR','EVAL','DECISION','EVENT','ENRICH_BAR',
+    'HEARTBEAT','ERROR','INGRESS_REJECT','QA_AUDIT','RECONCILE',
+    'MATERIALIZE_RUN','REPLAY_REPORT','SUPPRESS','DUPLICATE'
+  );
+EXCEPTION
+  WHEN duplicate_object THEN null;
+END $$;
+
+-- RUN REGISTRY
+CREATE TABLE IF NOT EXISTS runs (
+  run_id        text PRIMARY KEY,
+  env           env_t NOT NULL,
+  deployment_id text NOT NULL,
+  producer_id   producer_t NOT NULL,
+  timezone      text NOT NULL,
+
+  started_at_ms  bigint NOT NULL,
+  started_at_iso text NOT NULL,
+
+  first_cfg_sig  text,
+  last_cfg_sig   text,
+
+  status        text NOT NULL DEFAULT 'OPEN', -- OPEN/CLOSED/QUARANTINED
+  created_at_ms bigint NOT NULL
+);
+
+-- RAW EVENTS (append-only)
+CREATE TABLE IF NOT EXISTS raw_events (
+  uid                  text PRIMARY KEY,
+  row_type             row_type_t NOT NULL,
+  parent_uid           text,
+
+  run_id               text NOT NULL REFERENCES runs(run_id),
+  cfg_sig              text NOT NULL,
+
+  schema_version       int NOT NULL,
+  schema_registry_hash text NOT NULL,
+
+  producer_id          producer_t NOT NULL,
+  deployment_id        text NOT NULL,
+  env                  env_t NOT NULL,
+
+  exchange             text NOT NULL,
+  symbol               text NOT NULL,
+  tickerid             text NOT NULL,
+  instrument_type      text NOT NULL,
+  tf                   text NOT NULL,
+  tf_sec               int NOT NULL,
+  seq                  bigint NOT NULL,
+
+  t_subject_ms         bigint NOT NULL,
+  t_event_ms           bigint NOT NULL,
+  t_received_ms        bigint NOT NULL,
+  latency_ms           bigint NOT NULL,
+
+  t_subject_iso        text NOT NULL,
+  t_event_iso          text NOT NULL,
+  timezone             text NOT NULL,
+  day_id_utc           text NOT NULL,
+  day_id_local         text NOT NULL,
+  session_id           text NOT NULL,
+
+  auth_ok              boolean NOT NULL,
+  request_id           text,
+  ip_hash              text,
+  user_agent_hash      text,
+
+  parse_ok              boolean NOT NULL,
+  schema_match_ok       boolean NOT NULL,
+  unknown_keys_count    int NOT NULL,
+  missing_required_count int NOT NULL,
+
+  script_sha           text,
+
+  payload_sha256       text NOT NULL,
+  payload_size_bytes   int NOT NULL,
+  payload_raw_redacted jsonb NOT NULL,
+
+  created_at_ms        bigint NOT NULL
+);
+
+-- Idempotency invariants
+CREATE UNIQUE INDEX IF NOT EXISTS raw_run_seq_uq ON raw_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS raw_rowtype_day_idx ON raw_events(row_type, day_id_utc);
+CREATE INDEX IF NOT EXISTS raw_symbol_tf_day_idx ON raw_events(symbol, tf_sec, day_id_utc);
+CREATE INDEX IF NOT EXISTS raw_received_idx ON raw_events(t_received_ms DESC);
+
+COMMIT;
