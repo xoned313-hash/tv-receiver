@@ -1,11 +1,13 @@
 {
   "name": "tv-receiver",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "materializer": "node materializer.js"
+    "materializer": "node materializer.js",
+    "check:index": "node --check index.js",
+    "check:materializer": "node --check materializer.js"
   },
   "dependencies": {
     "express": "^4.18.2",
