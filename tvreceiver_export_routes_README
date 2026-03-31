@@ -1,0 +1,163 @@
+# tvreceiver export routes
+
+This is a small drop-in module for the current `tv-receiver` service.
+
+It adds authenticated CSV download routes for:
+- `bars`
+- `evals`
+- `configs`
+- `raw_events`
+
+It is designed for the current project shape where:
+- the receiver is an Express + `pg` service,
+- `raw_events` is the audit spine,
+- the materializer normalizes into `configs`, `bars`, and `evals`,
+- `B1M`, `B2M`, and `B3M` are the active streams.
+
+## 1) Put the file beside `index.js`
+
+Save:
+- `tvreceiver_export_routes.js`
+
+in the same folder as your receiver's `index.js`.
+
+## 2) Wire it into `index.js`
+
+Add this import near the top:
+
+```js
+import { installExportRoutes } from "./tvreceiver_export_routes.js";
+```
+
+Then call it after `ensureSchema()` succeeds and before `app.listen(...)`:
+
+```js
+async function main() {
+  await ensureSchema();
+  await pool.query("select 1");
+
+  installExportRoutes({
+    app,
+    pool,
+    webhookSecret: WEBHOOK_SECRET,
+  });
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`tv-receiver listening on ${PORT}`);
+  });
+}
+```
+
+That is the only code change needed.
+
+## 3) Redeploy
+
+Redeploy the receiver on DigitalOcean App Platform the same way you normally do.
+
+## 4) Try these URLs
+
+Replace:
+- `YOUR_APP_URL`
+- `YOUR_SECRET`
+
+### Route index
+
+```text
+https://YOUR_APP_URL/export?secret=YOUR_SECRET
+```
+
+### Bars CSV
+
+```text
+https://YOUR_APP_URL/export/bars.csv?secret=YOUR_SECRET
+```
+
+### Evals CSV
+
+```text
+https://YOUR_APP_URL/export/evals.csv?secret=YOUR_SECRET
+```
+
+### Configs CSV
+
+```text
+https://YOUR_APP_URL/export/configs.csv?secret=YOUR_SECRET
+```
+
+### Raw events CSV
+
+```text
+https://YOUR_APP_URL/export/raw_events.csv?secret=YOUR_SECRET
+```
+
+## 5) Useful filters
+
+You can combine these as query params:
+
+- `limit=5000`
+- `order=desc`
+- `from_ms=1743465600000`
+- `to_ms=1743552000000`
+- `symbol=ADAUSDT.P`
+- `tf=15`
+- `stream_id=B1M,B2M_AP,B3M_PIVOTS`
+- `run_id=RUN|...`
+- `request_id=...`
+- `uid=...`
+- `columns=uid,symbol,tf,t_close_ms,close,stream_id`
+- `include_payload=1`
+
+Examples:
+
+### Latest bars for one symbol
+
+```text
+https://YOUR_APP_URL/export/bars.csv?secret=YOUR_SECRET&symbol=ADAUSDT.P&limit=5000
+```
+
+### Only B1M bars in a time window
+
+```text
+https://YOUR_APP_URL/export/bars.csv?secret=YOUR_SECRET&stream_id=B1M&from_ms=1743465600000&to_ms=1743552000000&limit=10000
+```
+
+### AP rows only
+
+```text
+https://YOUR_APP_URL/export/bars.csv?secret=YOUR_SECRET&stream_id=B2M_AP&limit=5000
+```
+
+### Pivot rows only
+
+```text
+https://YOUR_APP_URL/export/bars.csv?secret=YOUR_SECRET&stream_id=B3M_PIVOTS&limit=5000
+```
+
+### Full raw events with payloads
+
+```text
+https://YOUR_APP_URL/export/raw_events.csv?secret=YOUR_SECRET&include_payload=1&limit=2000
+```
+
+## 6) Practical first use
+
+For your workflow, start with this:
+
+```text
+/export/bars.csv?secret=YOUR_SECRET&limit=10000
+```
+
+Download that file and upload it here.
+
+If the file is too large, narrow it with:
+- `stream_id=`
+- `symbol=`
+- `from_ms=` and `to_ms=`
+
+## 7) Notes
+
+- The module is fail-closed and requires the same query-string secret style as the receiver.
+- By default it excludes heavy `payload` columns from normalized tables. Add `include_payload=1` only when you actually want them.
+- `raw_events.csv` also exposes a `payload_preview` virtual column by default when payload columns are present.
+- The export routes do not change ingest behavior.
+- This is intended as the interim read/export path so you can get the data out of DigitalOcean without relying on MCP.
