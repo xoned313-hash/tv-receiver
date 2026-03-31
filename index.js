@@ -2,6 +2,7 @@
 import express from "express";
 import pg from "pg";
 import crypto from "crypto";
+import { installExportRoutes } from "./tvreceiver_export_routes.js";
 
 const { Pool } = pg;
 const app = express();
@@ -954,7 +955,7 @@ async function ingestRequest(req, res) {
       ip_hash: ipHash,
       user_agent_hash: userAgentHash,
       t_received_ms: tReceivedMs,
-      auth_ok: false,
+      auth_ok: authOk,
       parse_ok: false,
       raw_payload: parsed.raw_preview,
     });
@@ -1190,6 +1191,12 @@ app.post("/webhook", ingestRequest);
 async function main() {
   await ensureSchema();
   await pool.query("select 1");
+
+  installExportRoutes({
+    app,
+    pool,
+    webhookSecret: WEBHOOK_SECRET,
+  });
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`tv-receiver listening on ${PORT}`);
   });
