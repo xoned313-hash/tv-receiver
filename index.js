@@ -1,28 +1,22 @@
-
 import express from "express";
 import pg from "pg";
 import crypto from "crypto";
-import { installExportRoutes } from "./tvreceiver_export_routes.js";
 
 const { Pool } = pg;
 const app = express();
 
-// TradingView often sends text/plain. Parse everything as text and handle JSON ourselves.
 app.use(express.text({ type: "*/*", limit: "2mb" }));
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const RECEIVER_ENV = (process.env.RECEIVER_ENV || "prod").trim().toLowerCase();
-const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || "").trim();
 const DATABASE_URL_RAW = (process.env.DATABASE_URL || "").trim();
 const CA_CERT = (process.env.CA_CERT || process.env.DATABASE_CA_CERT || "").trim();
 const PGSSL_INSECURE = (process.env.PGSSL_INSECURE || "").trim() === "1";
+const TV_ALLOWED_IPS = (process.env.TV_ALLOWED_IPS || "").trim();
+const ALLOW_UNTRUSTED_INGRESS = (process.env.ALLOW_UNTRUSTED_INGRESS || "").trim() === "1";
 
 if (!DATABASE_URL_RAW) {
   console.error("FATAL: DATABASE_URL is not set");
-  process.exit(1);
-}
-if (!WEBHOOK_SECRET) {
-  console.error("FATAL: WEBHOOK_SECRET is not set (fail-closed)");
   process.exit(1);
 }
 if (!CA_CERT && !PGSSL_INSECURE) {
@@ -31,6 +25,10 @@ if (!CA_CERT && !PGSSL_INSECURE) {
 }
 if (PGSSL_INSECURE && RECEIVER_ENV === "prod") {
   console.error("FATAL: PGSSL_INSECURE=1 is forbidden when RECEIVER_ENV=prod");
+  process.exit(1);
+}
+if (!ALLOW_UNTRUSTED_INGRESS && RECEIVER_ENV === "prod" && !TV_ALLOWED_IPS) {
+  console.error("FATAL: TV_ALLOWED_IPS must be set in prod unless ALLOW_UNTRUSTED_INGRESS=1");
   process.exit(1);
 }
 
@@ -141,6 +139,17 @@ const CONTEXT_KEYS = [
   "price_quote", "contracts_def", "event_type"
 ];
 
+function parseAllowedIps(raw) {
+  const set = new Set();
+  for (const part of String(raw || "").split(",")) {
+    const ip = normalizeClientIp(part.trim());
+    if (ip) set.add(ip);
+  }
+  return set;
+}
+
+const ALLOWED_IP_SET = parseAllowedIps(TV_ALLOWED_IPS);
+
 function sha256Hex(value) {
   const h = crypto.createHash("sha256");
   h.update(typeof value === "string" ? value : String(value ?? ""));
@@ -209,12 +218,6 @@ function toInt(v) {
   return Number.isFinite(n) ? Math.trunc(n) : null;
 }
 
-function toFloat(v) {
-  if (isMissing(v)) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
 function parseTfSec(tf) {
   if (!isNonEmptyString(tf)) return null;
   const s = tf.trim().toUpperCase();
@@ -261,14 +264,28 @@ function sessionIdFromUTC(ms) {
   return "UTC_DAY_" + formatDayIdUTC(ms);
 }
 
+function normalizeClientIp(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const first = s.split(",")[0].trim();
+  return first.startsWith("::ffff:") ? first.slice(7) : first;
+}
+
 function getClientIp(req) {
   const xf = (req.headers["x-forwarded-for"] || "").toString();
-  if (xf) return xf.split(",")[0].trim();
-  return req.socket?.remoteAddress || "";
+  if (xf) return normalizeClientIp(xf);
+  return normalizeClientIp(req.socket?.remoteAddress || "");
 }
 
 function getUserAgent(req) {
   return (req.headers["user-agent"] || "").toString();
+}
+
+function isTrustedSource(ip) {
+  if (ALLOW_UNTRUSTED_INGRESS) return true;
+  if (ALLOWED_IP_SET.has("*")) return true;
+  if (!ip) return false;
+  return ALLOWED_IP_SET.has(normalizeClientIp(ip));
 }
 
 function makeRequestId() {
@@ -401,6 +418,8 @@ function buildFailureRecord({
   auth_ok,
   parse_ok,
   raw_payload,
+  record_index = 0,
+  raw_request_id = null,
 }) {
   const payload = redactDeep({
     reason,
@@ -409,8 +428,10 @@ function buildFailureRecord({
     raw_payload,
   });
   const payloadString = stableStringify(payload);
-  const uid = `${row_type}|${request_id || t_received_ms}`;
+  const uid = `${row_type}|${request_id || t_received_ms}|${record_index}`;
   return {
+    raw_request_id,
+    record_index,
     uid,
     row_type,
     parent_uid: null,
@@ -561,12 +582,13 @@ function prepareLogicalRecord(rec, meta) {
       auth_ok: meta.auth_ok,
       parse_ok: true,
       raw_payload: rec,
+      record_index: meta.record_index,
+      raw_request_id: meta.raw_request_id,
     });
   }
 
   const cfg = normalizeCfgSig(rec);
-  const rowType = meta.auth_ok ? rowTypeRaw : "INGRESS_REJECT";
-  const uid = isNonEmptyString(rec.uid) ? String(rec.uid).trim() : `${rowType}|${meta.request_id}|${rowTypeRaw}`;
+  const uid = isNonEmptyString(rec.uid) ? String(rec.uid).trim() : `${rowTypeRaw}|${meta.request_id}|${meta.record_index}`;
   const tfSec = toInt(rec.tf_sec) ?? parseTfSec(rec.tf) ?? 0;
   const tSubjectMs = toInt(rec.t_subject_ms)
     ?? toInt(rec.t_close_ms)
@@ -588,7 +610,6 @@ function prepareLogicalRecord(rec, meta) {
 
   const payload = redactDeep({
     ...rec,
-    row_type: rowType,
     producer_id: producerId,
     stream_id: streamId,
     cfg_sig_raw: cfg.cfg_sig_raw,
@@ -598,7 +619,7 @@ function prepareLogicalRecord(rec, meta) {
   const payloadString = stableStringify(payload);
 
   const working = {
-    row_type: rowType,
+    row_type: rowTypeRaw,
     uid,
     run_id: isNonEmptyString(rec.run_id) ? String(rec.run_id).trim() : "RUN_UNKNOWN",
     cfg_sig: cfg.cfg_sig_sha256 || cfg.cfg_sig_raw || "CFG_UNKNOWN",
@@ -621,8 +642,10 @@ function prepareLogicalRecord(rec, meta) {
   const unknownCount = unknownKeysCount(payload);
 
   return {
+    raw_request_id: meta.raw_request_id,
+    record_index: meta.record_index,
     uid,
-    row_type: rowType,
+    row_type: rowTypeRaw,
     parent_uid: working.parent_uid,
     run_id: working.run_id,
     cfg_sig: working.cfg_sig,
@@ -679,7 +702,7 @@ function prepareLogicalRecord(rec, meta) {
     user_agent_hash: meta.user_agent_hash,
     path: meta.path,
     script_sha: isNonEmptyString(rec.script_sha) ? String(rec.script_sha).trim() : null,
-    notes: meta.auth_ok ? null : `auth_failed_original_row_type=${rowTypeRaw}`,
+    notes: null,
     payload_sha256: sha256Hex(payloadString),
     payload_size_bytes: Buffer.byteLength(payloadString, "utf8"),
     payload,
@@ -706,6 +729,30 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
+    create table if not exists raw_requests (
+      id bigserial primary key,
+      request_id text not null unique,
+      received_at timestamptz not null default now(),
+      path text,
+      method text,
+      content_type text,
+      source_ip_hash text,
+      user_agent_hash text,
+      auth_ok boolean not null default false,
+      parse_ok boolean not null default false,
+      payload_sha256 text,
+      payload_size_bytes integer,
+      bundle_version integer,
+      bundle_type text,
+      sent_at_ms bigint,
+      record_count integer not null default 0,
+      raw_body text,
+      raw_body_redacted text,
+      notes text
+    );
+  `);
+
+  await pool.query(`
     create table if not exists raw_events (
       id bigserial primary key,
       received_at timestamptz not null default now(),
@@ -715,7 +762,9 @@ async function ensureSchema() {
   `);
 
   const addColumns = [
+    ["raw_request_id", "bigint"],
     ["request_id", "text"],
+    ["record_index", "integer"],
     ["row_type", "text"],
     ["uid", "text"],
     ["parent_uid", "text"],
@@ -780,6 +829,8 @@ async function ensureSchema() {
     await pool.query(`alter table raw_events add column if not exists ${col} ${type};`);
   }
 
+  await pool.query(`create index if not exists raw_requests_received_idx on raw_requests (received_at desc);`);
+  await pool.query(`create index if not exists raw_requests_payload_hash_idx on raw_requests (payload_sha256);`);
   await pool.query(`create index if not exists raw_events_received_at_idx on raw_events (received_at desc);`);
   await pool.query(`create unique index if not exists raw_events_uid_uidx on raw_events (uid) where uid is not null;`);
   await pool.query(`
@@ -787,6 +838,7 @@ async function ensureSchema() {
     on raw_events (run_id, seq)
     where run_id is not null and seq is not null and row_type in ('CONFIG', 'BAR', 'EVAL');
   `);
+  await pool.query(`create index if not exists raw_events_raw_request_idx on raw_events (raw_request_id);`);
   await pool.query(`create index if not exists raw_events_row_type_received_idx on raw_events (row_type, received_at desc);`);
   await pool.query(`create index if not exists raw_events_symbol_tf_subject_idx on raw_events (symbol, tf_sec, t_subject_ms desc);`);
   await pool.query(`create index if not exists runs_started_idx on runs (started_at_ms desc);`);
@@ -832,11 +884,60 @@ async function upsertRun(client, row) {
   );
 }
 
+async function insertRawRequest(client, row) {
+  const rs = await client.query(
+    `
+      insert into raw_requests (
+        request_id, path, method, content_type,
+        source_ip_hash, user_agent_hash,
+        auth_ok, parse_ok,
+        payload_sha256, payload_size_bytes,
+        bundle_version, bundle_type, sent_at_ms, record_count,
+        raw_body, raw_body_redacted, notes
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      on conflict (request_id) do update set
+        auth_ok = excluded.auth_ok,
+        parse_ok = excluded.parse_ok,
+        payload_sha256 = excluded.payload_sha256,
+        payload_size_bytes = excluded.payload_size_bytes,
+        bundle_version = excluded.bundle_version,
+        bundle_type = excluded.bundle_type,
+        sent_at_ms = excluded.sent_at_ms,
+        record_count = excluded.record_count,
+        raw_body = excluded.raw_body,
+        raw_body_redacted = excluded.raw_body_redacted,
+        notes = excluded.notes
+      returning id
+    `,
+    [
+      row.request_id,
+      row.path,
+      row.method,
+      row.content_type,
+      row.source_ip_hash,
+      row.user_agent_hash,
+      row.auth_ok,
+      row.parse_ok,
+      row.payload_sha256,
+      row.payload_size_bytes,
+      row.bundle_version,
+      row.bundle_type,
+      row.sent_at_ms,
+      row.record_count,
+      row.raw_body,
+      row.raw_body_redacted,
+      row.notes,
+    ]
+  );
+  return rs.rows[0].id;
+}
+
 async function insertRawEvent(client, row) {
   await client.query(
     `
       insert into raw_events (
-        path, payload, request_id,
+        raw_request_id, path, payload, request_id, record_index,
         row_type, uid, parent_uid,
         run_id, cfg_sig, cfg_sig_raw, cfg_sig_full, cfg_sig_sha256,
         schema_version, schema_registry_hash,
@@ -853,28 +954,30 @@ async function insertRawEvent(client, row) {
         payload_raw_redacted
       )
       values (
-        $1,$2,$3,
-        $4,$5,$6,
-        $7,$8,$9,$10,$11,
-        $12,$13,
-        $14,$15,$16,$17,$18,
-        $19,$20,
-        $21,$22,$23,$24,$25,$26,$27,
-        $28,$29,$30,$31,
-        $32,$33,$34,$35,$36,
-        $37,$38,$39,
-        $40,$41,$42,$43,
-        $44,$45,$46,$47,$48,$49,
-        $50,$51,$52,$53,$54,
-        $55,$56,$57,$58,$59,$60,
-        $61
+        $1,$2,$3,$4,$5,
+        $6,$7,$8,
+        $9,$10,$11,$12,$13,
+        $14,$15,
+        $16,$17,$18,$19,$20,
+        $21,$22,
+        $23,$24,$25,$26,$27,$28,$29,
+        $30,$31,$32,$33,
+        $34,$35,$36,$37,$38,
+        $39,$40,$41,
+        $42,$43,$44,$45,
+        $46,$47,$48,$49,$50,$51,
+        $52,$53,$54,$55,$56,
+        $57,$58,$59,$60,$61,$62,
+        $63
       )
       on conflict do nothing
     `,
     [
+      row.raw_request_id,
       row.path,
       row.payload,
       row.request_id,
+      row.record_index,
       row.row_type,
       row.uid,
       row.parent_uid,
@@ -937,116 +1040,168 @@ async function insertRawEvent(client, row) {
   );
 }
 
+function requestEnvelopeFromBody(body) {
+  const asObj = asObject(body);
+  if (!asObj) {
+    return { bundle_version: null, bundle_type: null, sent_at_ms: null, record_count: 0 };
+  }
+  if (Array.isArray(asObj.records)) {
+    return {
+      bundle_version: toInt(asObj.bundle_version),
+      bundle_type: isNonEmptyString(asObj.bundle_type) ? String(asObj.bundle_type).trim() : null,
+      sent_at_ms: toInt(asObj.sent_at_ms),
+      record_count: asObj.records.length,
+    };
+  }
+  return {
+    bundle_version: toInt(asObj.bundle_version),
+    bundle_type: isNonEmptyString(asObj.bundle_type) ? String(asObj.bundle_type).trim() : null,
+    sent_at_ms: toInt(asObj.sent_at_ms),
+    record_count: 1,
+  };
+}
+
+async function persistFailure(client, failure) {
+  await upsertRun(client, failure);
+  await insertRawEvent(client, failure);
+}
+
 async function ingestRequest(req, res) {
   const requestId = makeRequestId();
   const tReceivedMs = Date.now();
   const path = req.path;
-  const ipHash = sha256Hex(getClientIp(req) || "");
+  const method = req.method;
+  const clientIp = getClientIp(req);
+  const ipHash = sha256Hex(clientIp || "");
   const userAgentHash = sha256Hex(getUserAgent(req) || "");
-  const authOk = String(req.query.secret || "") === WEBHOOK_SECRET;
+  const authOk = isTrustedSource(clientIp);
+  const rawBody = typeof req.body === "string" ? req.body : "";
+  const contentType = (req.headers["content-type"] || "").toString();
+  const parsed = parseJsonBody(rawBody);
 
-  const parsed = parseJsonBody(req.body);
-  if (!parsed.ok) {
-    const failure = buildFailureRecord({
-      row_type: "ERROR",
-      reason: parsed.error,
-      request_id: requestId,
-      path,
-      ip_hash: ipHash,
-      user_agent_hash: userAgentHash,
-      t_received_ms: tReceivedMs,
-      auth_ok: authOk,
-      parse_ok: false,
-      raw_payload: parsed.raw_preview,
-    });
-    const client = await pool.connect();
-    try {
-      await client.query("begin");
-      await upsertRun(client, failure);
-      await insertRawEvent(client, failure);
-      await client.query("commit");
-    } catch (e) {
-      await client.query("rollback").catch(() => {});
-      console.error("failed to persist parse error:", e);
-    } finally {
-      client.release();
-    }
-    return res.status(400).json({ ok: false, error: parsed.error, request_id: requestId });
-  }
-
-  const body = parsed.value;
-  const rawBodyString = stableStringify(redactDeep(body));
-  if (/\"secret\"\s*:|\"webhook_secret\"\s*:|\"webhooksecret\"\s*:|\"token\"\s*:|\"authorization\"\s*:/i.test(rawBodyString)) {
-    const failure = buildFailureRecord({
-      row_type: "ERROR",
-      reason: "secret_in_body_forbidden",
-      request_id: requestId,
-      path,
-      ip_hash: ipHash,
-      user_agent_hash: userAgentHash,
-      t_received_ms: tReceivedMs,
-      auth_ok: authOk,
-      parse_ok: true,
-      raw_payload: "[REDACTED_AT_INGRESS]",
-    });
-    const client = await pool.connect();
-    try {
-      await client.query("begin");
-      await upsertRun(client, failure);
-      await insertRawEvent(client, failure);
-      await client.query("commit");
-    } catch (e) {
-      await client.query("rollback").catch(() => {});
-      console.error("failed to persist secret-in-body error:", e);
-    } finally {
-      client.release();
-    }
-    return res.status(400).json({ ok: false, error: "secret_in_body_forbidden", request_id: requestId });
-  }
-
-  const logicalRecords = expandLogicalRecords(body);
-  if (logicalRecords.length === 0) {
-    const failure = buildFailureRecord({
-      row_type: "ERROR",
-      reason: "no_logical_records_found",
-      request_id: requestId,
-      path,
-      ip_hash: ipHash,
-      user_agent_hash: userAgentHash,
-      t_received_ms: tReceivedMs,
-      auth_ok: authOk,
-      parse_ok: true,
-      raw_payload: body,
-    });
-    const client = await pool.connect();
-    try {
-      await client.query("begin");
-      await upsertRun(client, failure);
-      await insertRawEvent(client, failure);
-      await client.query("commit");
-    } catch (e) {
-      await client.query("rollback").catch(() => {});
-      console.error("failed to persist empty-record error:", e);
-    } finally {
-      client.release();
-    }
-    return res.status(400).json({ ok: false, error: "no_logical_records_found", request_id: requestId });
-  }
+  const parsedBody = parsed.ok ? parsed.value : null;
+  const envelope = requestEnvelopeFromBody(parsedBody);
+  const rawBodyRedacted = parsed.ok ? stableStringify(redactDeep(parsedBody)) : "";
+  const rawRequestRow = {
+    request_id: requestId,
+    path,
+    method,
+    content_type: contentType,
+    source_ip_hash: ipHash,
+    user_agent_hash: userAgentHash,
+    auth_ok: authOk,
+    parse_ok: parsed.ok,
+    payload_sha256: sha256Hex(rawBody),
+    payload_size_bytes: Buffer.byteLength(rawBody || "", "utf8"),
+    bundle_version: envelope.bundle_version,
+    bundle_type: envelope.bundle_type,
+    sent_at_ms: envelope.sent_at_ms,
+    record_count: envelope.record_count,
+    raw_body: rawBody,
+    raw_body_redacted: rawBodyRedacted,
+    notes: null,
+  };
 
   const client = await pool.connect();
-  let inserted = 0;
+  let rawRequestId = null;
 
   try {
     await client.query("begin");
+    rawRequestId = await insertRawRequest(client, rawRequestRow);
 
-    for (const logical of logicalRecords) {
-      const prepared = prepareLogicalRecord(logical, {
+    if (!parsed.ok) {
+      const failure = buildFailureRecord({
+        row_type: "ERROR",
+        reason: parsed.error,
         request_id: requestId,
         path,
         ip_hash: ipHash,
         user_agent_hash: userAgentHash,
         t_received_ms: tReceivedMs,
         auth_ok: authOk,
+        parse_ok: false,
+        raw_payload: parsed.raw_preview,
+        record_index: 0,
+        raw_request_id: rawRequestId,
+      });
+      await persistFailure(client, failure);
+      await client.query("commit");
+      return res.status(400).json({ ok: false, error: parsed.error, request_id: requestId });
+    }
+
+    if (/\"secret\"\s*:|\"webhook_secret\"\s*:|\"webhooksecret\"\s*:|\"token\"\s*:|\"authorization\"\s*:/i.test(rawBodyRedacted)) {
+      const failure = buildFailureRecord({
+        row_type: "ERROR",
+        reason: "secret_in_body_forbidden",
+        request_id: requestId,
+        path,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        t_received_ms: tReceivedMs,
+        auth_ok: authOk,
+        parse_ok: true,
+        raw_payload: "[REDACTED_AT_INGRESS]",
+        record_index: 0,
+        raw_request_id: rawRequestId,
+      });
+      await persistFailure(client, failure);
+      await client.query("commit");
+      return res.status(400).json({ ok: false, error: "secret_in_body_forbidden", request_id: requestId });
+    }
+
+    if (!authOk) {
+      const failure = buildFailureRecord({
+        row_type: "INGRESS_REJECT",
+        reason: "source_not_allowed",
+        request_id: requestId,
+        path,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        t_received_ms: tReceivedMs,
+        auth_ok: false,
+        parse_ok: true,
+        raw_payload: "[REDACTED_AT_INGRESS]",
+        record_index: 0,
+        raw_request_id: rawRequestId,
+      });
+      await persistFailure(client, failure);
+      await client.query("commit");
+      return res.status(403).json({ ok: false, error: "source_not_allowed", request_id: requestId });
+    }
+
+    const logicalRecords = expandLogicalRecords(parsedBody);
+    if (logicalRecords.length === 0) {
+      const failure = buildFailureRecord({
+        row_type: "ERROR",
+        reason: "no_logical_records_found",
+        request_id: requestId,
+        path,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        t_received_ms: tReceivedMs,
+        auth_ok: authOk,
+        parse_ok: true,
+        raw_payload: parsedBody,
+        record_index: 0,
+        raw_request_id: rawRequestId,
+      });
+      await persistFailure(client, failure);
+      await client.query("commit");
+      return res.status(400).json({ ok: false, error: "no_logical_records_found", request_id: requestId });
+    }
+
+    let inserted = 0;
+    for (let index = 0; index < logicalRecords.length; index += 1) {
+      const logical = logicalRecords[index];
+      const prepared = prepareLogicalRecord(logical, {
+        request_id: requestId,
+        raw_request_id: rawRequestId,
+        record_index: index,
+        path,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        t_received_ms: tReceivedMs,
+        auth_ok: true,
       });
       await upsertRun(client, prepared);
       await insertRawEvent(client, prepared);
@@ -1054,27 +1209,34 @@ async function ingestRequest(req, res) {
     }
 
     await client.query("commit");
+    return res.json({ ok: true, request_id: requestId, raw_request_id: rawRequestId, inserted });
   } catch (e) {
     await client.query("rollback").catch(() => {});
     console.error("ingest failed:", e);
 
-    const failure = buildFailureRecord({
-      row_type: "ERROR",
-      reason: `ingest_exception:${e?.message || String(e)}`,
-      request_id: requestId,
-      path,
-      ip_hash: ipHash,
-      user_agent_hash: userAgentHash,
-      t_received_ms: tReceivedMs,
-      auth_ok: authOk,
-      parse_ok: true,
-      raw_payload: "[REDACTED_AT_INGRESS]",
-    });
-
     try {
       await client.query("begin");
-      await upsertRun(client, failure);
-      await insertRawEvent(client, failure);
+      if (rawRequestId == null) {
+        rawRequestId = await insertRawRequest(client, {
+          ...rawRequestRow,
+          notes: `ingest_exception_pre_row:${e?.message || String(e)}`,
+        });
+      }
+      const failure = buildFailureRecord({
+        row_type: "ERROR",
+        reason: `ingest_exception:${e?.message || String(e)}`,
+        request_id: requestId,
+        path,
+        ip_hash: ipHash,
+        user_agent_hash: userAgentHash,
+        t_received_ms: tReceivedMs,
+        auth_ok: authOk,
+        parse_ok: parsed.ok,
+        raw_payload: "[REDACTED_AT_INGRESS]",
+        record_index: 0,
+        raw_request_id: rawRequestId,
+      });
+      await persistFailure(client, failure);
       await client.query("commit");
     } catch (e2) {
       await client.query("rollback").catch(() => {});
@@ -1085,103 +1247,31 @@ async function ingestRequest(req, res) {
   } finally {
     client.release();
   }
-
-  if (!authOk) {
-    return res.status(401).json({ ok: false, error: "unauthorized", request_id: requestId, inserted });
-  }
-  return res.json({ ok: true, request_id: requestId, inserted });
 }
 
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
 app.get("/healthz", async (_req, res) => {
   try {
-    await pool.query("select 1 as ok");
-    const counts = await pool.query(`
-      select row_type, count(*)::bigint as n
-      from raw_events
-      group by row_type
-      order by row_type
-    `);
-    const last = await pool.query(`
-      select max(received_at) as last_received_at, max(t_received_ms)::bigint as last_received_ms
-      from raw_events
-    `);
-    res.json({
-      ok: true,
-      env: RECEIVER_ENV,
-      db_ok: true,
-      tls: {
-        ca_cert_configured: Boolean(CA_CERT),
-        insecure_allowed: PGSSL_INSECURE,
-      },
-      raw_events_by_type: counts.rows,
-      last_received_at: last.rows[0]?.last_received_at || null,
-      last_received_ms: last.rows[0]?.last_received_ms || null,
-      now: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      env: RECEIVER_ENV,
-      db_ok: false,
-      error: { message: e.message, code: e.code || null },
-      now: new Date().toISOString(),
-    });
-  }
-});
-
-app.get("/schema/raw_events", async (req, res) => {
-  if (String(req.query.secret || "") !== WEBHOOK_SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  try {
-    const cols = await pool.query(`
-      select column_name, data_type, is_nullable
-      from information_schema.columns
-      where table_schema='public' and table_name='raw_events'
-      order by ordinal_position
-    `);
-    res.json({ ok: true, columns: cols.rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: { message: e.message, code: e.code || null } });
-  }
-});
-
-app.get("/export/raw_events", async (req, res) => {
-  if (String(req.query.secret || "") !== WEBHOOK_SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  const limit = Math.min(Math.max(parseInt(req.query.limit || "200", 10) || 200, 1), 5000);
-  try {
-    const rows = await pool.query(
-      `
+    const rs = await pool.query(`
       select
-        id,
-        received_at,
-        path,
-        row_type,
-        uid,
-        run_id,
-        symbol,
-        tf,
-        seq,
-        auth_ok,
-        parse_ok,
-        schema_match_ok,
-        request_id,
-        ip_hash,
-        user_agent_hash,
-        left(coalesce(payload::text, payload_raw_redacted::text, ''), 1500) as payload_preview
-      from raw_events
-      order by received_at desc, id desc
-      limit $1
-      `,
-      [limit]
-    );
-    res.json({ ok: true, limit, row_count: rows.rows.length, rows: rows.rows });
+        (select count(*) from raw_requests) as raw_requests,
+        (select count(*) from raw_events) as raw_events
+    `);
+
+    return res.json({
+      ok: true,
+      service: "tv_receiver_secret_free_ingress",
+      env: RECEIVER_ENV,
+      allow_untrusted_ingress: ALLOW_UNTRUSTED_INGRESS,
+      allowed_ip_count: ALLOWED_IP_SET.size,
+      database_ok: true,
+      counts: rs.rows[0] || {},
+      now_utc: new Date().toISOString(),
+      paths: ["/tv", "/webhook", "/healthz"],
+    });
   } catch (e) {
-    res.status(500).json({ ok: false, error: { message: e.message, code: e.code || null } });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -1191,18 +1281,12 @@ app.post("/webhook", ingestRequest);
 async function main() {
   await ensureSchema();
   await pool.query("select 1");
-
-  installExportRoutes({
-    app,
-    pool,
-    webhookSecret: WEBHOOK_SECRET,
-  });
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`tv-receiver listening on ${PORT}`);
+    console.log(`tv-receiver secret-free ingress listening on ${PORT}`);
   });
 }
 
 main().catch((e) => {
-  console.error("FATAL: receiver startup failed:", e);
+  console.error("fatal startup error:", e);
   process.exit(1);
 });
