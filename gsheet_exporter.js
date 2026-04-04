@@ -18,7 +18,7 @@ const EXPORTER_BATCH_SIZE = Math.max(1, parseInt(process.env.EXPORTER_BATCH_SIZE
 const EXPORTER_POLL_MS = Math.max(1000, parseInt(process.env.EXPORTER_POLL_MS || "5000", 10));
 const EXPORTER_TAIL_RECONCILE_ROWS = Math.max(25, parseInt(process.env.EXPORTER_TAIL_RECONCILE_ROWS || "200", 10));
 const ENABLE_TAIL_RECONCILE = (process.env.ENABLE_TAIL_RECONCILE || "1").trim() !== "0";
-const RAW_REQUESTS_REQUIRED = (process.env.RAW_REQUESTS_REQUIRED || "0").trim() === "1";
+const RAW_REQUESTS_REQUIRED = (process.env.RAW_REQUESTS_REQUIRED || "1").trim() === "1";
 
 if (!DATABASE_URL_RAW) {
   console.error("FATAL: DATABASE_URL is not set");
@@ -34,6 +34,10 @@ if (PGSSL_INSECURE && EXPORTER_ENV === "prod") {
 }
 if (!GOOGLE_SPREADSHEET_ID) {
   console.error("FATAL: GOOGLE_SPREADSHEET_ID is not set");
+  process.exit(1);
+}
+if (EXPORTER_ENV === "prod" && !RAW_REQUESTS_REQUIRED) {
+  console.error("FATAL: RAW_REQUESTS_REQUIRED=0 is forbidden when EXPORTER_ENV=prod");
   process.exit(1);
 }
 
@@ -322,6 +326,274 @@ function loadHeaders() {
   const raw = fs.readFileSync(WORKBOOK_HEADERS_PATH, "utf8");
   return JSON.parse(raw);
 }
+
+
+const README_LINES = [
+  [
+    "DigitalOcean telemetry delivery workbook",
+    "This workbook is the governed human-readable product for the current contract stage. DigitalOcean is the ingress, raw-capture, normalization, materialization, and export authority."
+  ],
+  [
+    "Accepted producer streams",
+    "B1M, B2M_AP, and B3M_PIVOTS."
+  ],
+  [
+    "Ingress path",
+    "TradingView sends secret-free webhook traffic to DigitalOcean first. DigitalOcean captures raw requests first, materializes governed rows, and then writes this workbook as the single writer."
+  ],
+  [
+    "Producer alert rule",
+    "Condition = Any alert() function call, Message = {{message}}, Frequency = Once Per Bar Close, and the public webhook URL must be the secret-free DigitalOcean receiver."
+  ],
+  [
+    "Equal-footing rule",
+    "Every retained logical row has base_weight = 1. Meaning is carried by analysis_role rather than numerical down-weighting."
+  ],
+  [
+    "CSV-wide rule",
+    "When BAR payloads carry raw csv, the BAR detail tab preserves that raw csv and the matching *_BAR_CSV_WIDE tab expands it into governed columns with csv_parse_ok and csv_field_count diagnostics."
+  ],
+  [
+    "Orientation materials",
+    "README, SCRIPT_KEY, and DATA_DICTIONARY are part of the required governed workbook structure for this stage and are regenerated from the current governed header registry."
+  ],
+  [
+    "Contract alignment",
+    "This workbook shape is aligned to the April 4, 2026 official contract, B1M v2.1.6, B2M_AP v1.0.4 / build_005, B3M_PIVOTS v1.0.4 / build_005, and the governed workbook/header shape from Google Sheets intake v1.4.0."
+  ],
+  [
+    "Verification rule",
+    "Completion requires four-surface reconciliation: TradingView log, DigitalOcean raw receipts, DigitalOcean logical/materialized rows, and Google Sheet rows."
+  ]
+];
+
+const SCRIPT_KEY_HEADERS = ["stream_id","producer_id","row_types","semantic_role","join_key","profiles","equal_weight_rule","notes"];
+const STREAM_SUMMARY = [
+  {
+    stream_id: "B1M",
+    producer_id: "B1M",
+    row_types: "CONFIG | BAR | EVAL",
+    semantic_role: "Primary market-state / canonical bar-close truth stream",
+    join_key: "BAR uid is the canonical bar key; joins use uid or normalized bar_uid_canonical.",
+    profiles: "emitMode default=BUNDLE_JSON; includeCsvInJson default=true; governed raw BAR csv retention and B1M_BAR_CSV_WIDE delivery enabled.",
+    equal_weight_rule: "All retained logical rows base_weight=1; BAR rows analysis_eligible=true.",
+    notes: "Current approved implementation: B1M v2.1.6."
+  },
+  {
+    stream_id: "B2M_AP",
+    producer_id: "B2M",
+    row_types: "CONFIG | BAR | EVAL",
+    semantic_role: "Structured momentum / parity / ML / kernel / trade-state stream",
+    join_key: "bar_uid_canonical links B2M BAR/EVAL rows back to the canonical B1M bar.",
+    profiles: "emitMode default=BUNDLE_JSON; includeCsvInJson default=true; sep default=,; CONFIG preserves csv_col_count and may preserve csv_header; governed raw BAR csv retention and B2M_BAR_CSV_WIDE delivery enabled.",
+    equal_weight_rule: "All retained logical rows base_weight=1; BAR rows analysis_eligible=true.",
+    notes: "Current approved implementation: B2M_AP v1.0.4 / B2M_AP_DB_FIRST_build_005."
+  },
+  {
+    stream_id: "B3M_PIVOTS",
+    producer_id: "B3M",
+    row_types: "CONFIG | BAR | EVAL",
+    semantic_role: "Structured pivot / boundary / nearest-level stream",
+    join_key: "bar_uid_canonical links B3M BAR/EVAL rows back to the canonical B1M bar.",
+    profiles: "emitMode default=BUNDLE_JSON; includeCsvInJson default=true; sep default=,; CONFIG preserves csv_col_count and may preserve csv_header; governed raw BAR csv retention and B3M_BAR_CSV_WIDE delivery enabled.",
+    equal_weight_rule: "All retained logical rows base_weight=1; BAR rows analysis_eligible=true.",
+    notes: "Current approved implementation: B3M_PIVOTS v1.0.4 / B3M_PIVOTS_DB_FIRST_build_005."
+  }
+];
+const DATA_DICTIONARY_HEADERS = ["tab_name","column_name","meaning","units","source_stream","data_type","notes"];
+
+function assertContractHeaders(headersByTab) {
+  const requiredTabs = [
+    "RAW_ENVELOPES","LEDGER",
+    "B1M_CONFIG","B1M_BAR","B1M_EVAL","B1M_BAR_CSV_WIDE",
+    "B2M_CONFIG","B2M_BAR","B2M_EVAL","B2M_BAR_CSV_WIDE",
+    "B3M_CONFIG","B3M_BAR","B3M_EVAL","B3M_BAR_CSV_WIDE",
+  ];
+  for (const tabName of requiredTabs) {
+    if (!headersByTab[tabName]) throw new Error(`Missing governed tab definition: ${tabName}`);
+  }
+  const requiredColumnsByTab = {
+    B2M_CONFIG: ["include_csv_in_json", "sep", "csv_col_count", "csv_header"],
+    B3M_CONFIG: ["include_csv_in_json", "sep", "csv_col_count", "csv_header"],
+    B2M_BAR: ["csv"],
+    B3M_BAR: ["csv"],
+    B1M_BAR_CSV_WIDE: ["csv_parse_ok", "csv_field_count"],
+    B2M_BAR_CSV_WIDE: ["csv_parse_ok", "csv_field_count"],
+    B3M_BAR_CSV_WIDE: ["csv_parse_ok", "csv_field_count"],
+  };
+  for (const [tabName, requiredColumns] of Object.entries(requiredColumnsByTab)) {
+    const headers = headersByTab[tabName] || [];
+    for (const columnName of requiredColumns) {
+      if (!headers.includes(columnName)) {
+        throw new Error(`Governed header mismatch: ${tabName} is missing required column ${columnName}`);
+      }
+    }
+  }
+}
+
+function dictionarySourceStream(tabName) {
+  if (/^B1M/.test(tabName)) return "B1M";
+  if (/^B2M/.test(tabName)) return "B2M_AP";
+  if (/^B3M/.test(tabName)) return "B3M_PIVOTS";
+  return "COMMON";
+}
+
+function humanizeColumnName(columnName) {
+  return String(columnName || "")
+    .replace(/_/g, " ")
+    .replace(/ms/gi, "ms")
+    .replace(/cfg/gi, "config")
+    .replace(/uid/gi, "UID");
+}
+
+function defaultDictionaryMeaning(tabName, columnName) {
+  if (columnName === "csv") return "Raw BAR csv line as emitted by the producer payload for this record.";
+  if (columnName === "csv_parse_ok") return "True when the raw csv field parsed to the governed number of columns for this tab.";
+  if (columnName === "csv_field_count") return "Number of parsed csv fields detected in the raw csv line.";
+  if (columnName === "raw_json") return "JSON rendering of the retained logical record for audit and review.";
+  if (columnName === "cfg_sig") return "Configuration signature emitted by the producer for this run/configuration.";
+  if (columnName === "cfg_sig_raw") return "Raw configuration signature as received from the producer.";
+  if (columnName === "cfg_sig_full") return "Expanded configuration signature payload preserved for hash/audit use.";
+  if (columnName === "cfg_sig_sha256_local") return "Locally computed sha256 of cfg_sig_full when cfg_sig_full is present.";
+  if (columnName === "request_id") return "Receiver-generated identifier for the HTTP ingress request.";
+  if (columnName === "record_index") return "Zero-based position of the logical record inside the parsed request payload.";
+  if (columnName === "stream_id") return "Governed stream identifier after normalization.";
+  if (columnName === "row_type") return "Logical row class such as CONFIG, BAR, EVAL, or retained error state.";
+  if (columnName === "event_type") return "Event subtype carried or derived for the logical row.";
+  if (columnName === "uid") return "Primary logical row identifier preserved for audit and joins.";
+  if (columnName === "dedup") return "Producer-side deduplication key or fallback UID.";
+  if (columnName === "bar_uid_canonical") return "Canonical B1M-style bar UID used for cross-stream joins.";
+  if (columnName.endsWith("_ms")) return humanizeColumnName(columnName) + " timestamp in UTC milliseconds.";
+  if (columnName.endsWith("_csv")) return "Delimited text field preserved exactly as emitted by the producer.";
+  return "Governed field: " + humanizeColumnName(columnName) + ".";
+}
+
+function defaultDictionaryUnits(columnName) {
+  if (/_ms$/.test(columnName)) return "ms UTC";
+  if (/_pct$/.test(columnName)) return "%";
+  if (/_count$/.test(columnName) || /^(seq|record_index|bar_index|tf_sec|csv_field_count)$/.test(columnName)) return "count";
+  if (/(^open$|^high$|^low$|^close$|_price$|_value$|_line$|_anchor$|_center$|_near$|_far$|_diff$|_res$|_sup$|_atr$|_slope$|_delta$|_eps$|_measure$)/.test(columnName)) return "producer native units";
+  if (/(^volume$|_volume$)/.test(columnName)) return "producer native volume units";
+  if (/(^csv_parse_ok$|_any$|_final$|_valid$|_eligible$|_ok$|^parse_ok$)/.test(columnName)) return "flag";
+  return "";
+}
+
+function defaultDictionaryType(columnName) {
+  if (/_ms$/.test(columnName) || /(_count$|^(seq|record_index|bar_index|tf_sec|csv_field_count|kernel_state|ml_signal)$)/.test(columnName)) return "integer";
+  if (/(^csv_parse_ok$|_any$|_final$|_valid$|_eligible$|_ok$|^parse_ok$)/.test(columnName)) return "boolean/flag";
+  if (columnName === "raw_json" || columnName === "csv" || columnName.endsWith("_csv") || /(uid|dedup|symbol|tickerid|event_type|producer|stream_id|row_type|alert_tag|cfg_sig|time_basis|env|deployment_id|timezone_id|instrument_type|price_quote|contracts_def|exchange|source_family|research_profile|compression_note|meaning|notes|log_tag|emit_mode|emit_reason)/.test(columnName)) return "string";
+  return "number/string";
+}
+
+function defaultDictionaryNotes(tabName, columnName, isCsvWide) {
+  if (isCsvWide && !/^request_id$|^record_index$|^ingest_ts_utc$|^stream_id$|^uid$|^symbol$|^tickerid$|^tf$|^t_subject_ms$|^csv_parse_ok$|^csv_field_count$/.test(columnName)) {
+    return "Parsed from the BAR.csv field for this stream when present. Column order is governed by the producer csv header definition for this stream.";
+  }
+  if (columnName === "csv") return "This raw BAR csv string is also the source material for the matching *_BAR_CSV_WIDE tab when present.";
+  if (columnName === "raw_json") return "Retained as text for audit/review; large values may be truncated for spreadsheet safety.";
+  if (tabName === "RAW_ENVELOPES") return "Request-level ingress evidence retained before logical-row expansion.";
+  if (tabName === "LEDGER") return "Normalized cross-stream ledger row.";
+  return "";
+}
+
+function buildDataDictionaryRows(headersByTab) {
+  const rows = [DATA_DICTIONARY_HEADERS];
+  Object.keys(headersByTab).forEach((tabName) => {
+    const sourceStream = dictionarySourceStream(tabName);
+    const isCsvWide = /_BAR_CSV_WIDE$/.test(tabName);
+    headersByTab[tabName].forEach((columnName) => {
+      rows.push([
+        tabName,
+        columnName,
+        defaultDictionaryMeaning(tabName, columnName),
+        defaultDictionaryUnits(columnName),
+        sourceStream,
+        defaultDictionaryType(columnName),
+        defaultDictionaryNotes(tabName, columnName, isCsvWide),
+      ]);
+    });
+  });
+  return rows;
+}
+
+async function getWorkbookMeta(sheetsApi) {
+  const meta = await sheetsApi.spreadsheets.get({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    fields: "sheets(properties(sheetId,title))",
+  });
+  const titleToId = new Map();
+  const existingTitles = new Set();
+  for (const sheet of meta.data.sheets || []) {
+    const title = sheet.properties?.title;
+    const sheetId = sheet.properties?.sheetId;
+    if (title) existingTitles.add(title);
+    if (title && sheetId !== undefined) titleToId.set(title, sheetId);
+  }
+  return { existingTitles, titleToId };
+}
+
+async function ensureSheetTitles(sheetsApi, titles) {
+  let meta = await getWorkbookMeta(sheetsApi);
+  const addRequests = [];
+  for (const title of titles) {
+    if (!meta.existingTitles.has(title)) addRequests.push({ addSheet: { properties: { title } } });
+  }
+  if (addRequests.length) {
+    await sheetsApi.spreadsheets.batchUpdate({
+      spreadsheetId: GOOGLE_SPREADSHEET_ID,
+      requestBody: { requests: addRequests },
+    });
+    meta = await getWorkbookMeta(sheetsApi);
+  }
+  return meta;
+}
+
+async function clearAndWriteMatrixSheet(sheetsApi, title, rows) {
+  await sheetsApi.spreadsheets.values.clear({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    range: `${title}!A:ZZZ`,
+  });
+  await sheetsApi.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    range: `${title}!A1`,
+    valueInputOption: "RAW",
+    requestBody: { values: rows },
+  });
+}
+
+async function freezeFirstRow(sheetsApi, titleToId, title) {
+  const sheetId = titleToId.get(title);
+  if (sheetId === undefined) return;
+  await sheetsApi.spreadsheets.batchUpdate({
+    spreadsheetId: GOOGLE_SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          updateSheetProperties: {
+            properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+            fields: "gridProperties.frozenRowCount",
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function ensureAuxiliarySheets(sheetsApi, headersByTab) {
+  const scriptKeyRows = [
+    SCRIPT_KEY_HEADERS,
+    ...STREAM_SUMMARY.map((x) => [x.stream_id, x.producer_id, x.row_types, x.semantic_role, x.join_key, x.profiles, x.equal_weight_rule, x.notes]),
+  ];
+  const dictionaryRows = buildDataDictionaryRows(headersByTab);
+  const meta = await ensureSheetTitles(sheetsApi, ["README", "SCRIPT_KEY", "DATA_DICTIONARY"]);
+  await clearAndWriteMatrixSheet(sheetsApi, "README", README_LINES);
+  await clearAndWriteMatrixSheet(sheetsApi, "SCRIPT_KEY", scriptKeyRows);
+  await clearAndWriteMatrixSheet(sheetsApi, "DATA_DICTIONARY", dictionaryRows);
+  await freezeFirstRow(sheetsApi, meta.titleToId, "README");
+  await freezeFirstRow(sheetsApi, meta.titleToId, "SCRIPT_KEY");
+  await freezeFirstRow(sheetsApi, meta.titleToId, "DATA_DICTIONARY");
+}
+
 
 function loadServiceAccount() {
   if (GOOGLE_SERVICE_ACCOUNT_JSON) return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -743,8 +1015,10 @@ async function runOnce(sheetsApi, headersByTab) {
 
 async function main() {
   const headersByTab = loadHeaders();
+  assertContractHeaders(headersByTab);
   await ensureExporterSchema();
   const sheetsApi = await getSheetsClient();
+  await ensureAuxiliarySheets(sheetsApi, headersByTab);
   await ensureWorkbookSheets(sheetsApi, headersByTab);
 
   console.log("gsheet-exporter ready");
