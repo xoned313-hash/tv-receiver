@@ -1,6 +1,6 @@
 {
   "name": "tv-receiver",
-  "version": "3.0.0",
+  "version": "4.0.0-contract-aligned",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,8 @@
     "gsheet-exporter": "node gsheet_exporter.js",
     "check:index": "node --check index.js",
     "check:materializer": "node --check materializer.js",
-    "check:gsheet-exporter": "node --check gsheet_exporter.js"
+    "check:gsheet-exporter": "node --check gsheet_exporter.js",
+    "check:all": "node --check index.js && node --check materializer.js && node --check gsheet_exporter.js"
   },
   "dependencies": {
     "express": "^4.18.2",
