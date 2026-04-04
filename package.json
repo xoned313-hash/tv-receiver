@@ -1,16 +1,19 @@
 {
   "name": "tv-receiver",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "materializer": "node materializer.js",
+    "gsheet-exporter": "node gsheet_exporter.js",
     "check:index": "node --check index.js",
-    "check:materializer": "node --check materializer.js"
+    "check:materializer": "node --check materializer.js",
+    "check:gsheet-exporter": "node --check gsheet_exporter.js"
   },
   "dependencies": {
     "express": "^4.18.2",
+    "googleapis": "^146.0.0",
     "pg": "^8.11.5"
   }
 }
