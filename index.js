@@ -27,8 +27,12 @@ if (PGSSL_INSECURE && RECEIVER_ENV === "prod") {
   console.error("FATAL: PGSSL_INSECURE=1 is forbidden when RECEIVER_ENV=prod");
   process.exit(1);
 }
-if (!ALLOW_UNTRUSTED_INGRESS && RECEIVER_ENV === "prod" && !TV_ALLOWED_IPS) {
-  console.error("FATAL: TV_ALLOWED_IPS must be set in prod unless ALLOW_UNTRUSTED_INGRESS=1");
+if (ALLOW_UNTRUSTED_INGRESS && RECEIVER_ENV === "prod") {
+  console.error("FATAL: ALLOW_UNTRUSTED_INGRESS=1 is forbidden when RECEIVER_ENV=prod");
+  process.exit(1);
+}
+if (RECEIVER_ENV === "prod" && !TV_ALLOWED_IPS) {
+  console.error("FATAL: TV_ALLOWED_IPS must be set in prod");
   process.exit(1);
 }
 
@@ -149,6 +153,10 @@ function parseAllowedIps(raw) {
 }
 
 const ALLOWED_IP_SET = parseAllowedIps(TV_ALLOWED_IPS);
+if (RECEIVER_ENV === "prod" && ALLOWED_IP_SET.has("*")) {
+  console.error("FATAL: TV_ALLOWED_IPS=* is forbidden when RECEIVER_ENV=prod");
+  process.exit(1);
+}
 
 function sha256Hex(value) {
   const h = crypto.createHash("sha256");
@@ -1078,6 +1086,8 @@ async function ingestRequest(req, res) {
   const rawBody = typeof req.body === "string" ? req.body : "";
   const contentType = (req.headers["content-type"] || "").toString();
   const parsed = parseJsonBody(rawBody);
+  const originalUrl = (req.originalUrl || "").toString();
+  const queryString = originalUrl.includes("?") ? originalUrl.slice(originalUrl.indexOf("?") + 1) : "";
 
   const parsedBody = parsed.ok ? parsed.value : null;
   const envelope = requestEnvelopeFromBody(parsedBody);
@@ -1125,9 +1135,33 @@ async function ingestRequest(req, res) {
         raw_request_id: rawRequestId,
       });
       await persistFailure(client, failure);
-      await client.query("commit");
-      return res.status(400).json({ ok: false, error: parsed.error, request_id: requestId });
-    }
+
+  await client.query("commit");
+  return res.status(400).json({ ok: false, error: parsed.error, request_id: requestId });
+}
+
+if (queryString) {
+  const reason = /(^|[?&])(secret|webhook_secret|webhooksecret|token|authorization|api_key|apikey|password|auth|key)=/i.test("?" + queryString)
+    ? "secret_in_query_forbidden"
+    : "query_string_forbidden";
+  const failure = buildFailureRecord({
+    row_type: "INGRESS_REJECT",
+    reason,
+    request_id: requestId,
+    path,
+    ip_hash: ipHash,
+    user_agent_hash: userAgentHash,
+    t_received_ms: tReceivedMs,
+    auth_ok: authOk,
+    parse_ok: parsed.ok,
+    raw_payload: parsed.ok ? "[REDACTED_AT_INGRESS]" : parsed.raw_preview,
+    record_index: 0,
+    raw_request_id: rawRequestId,
+  });
+  await persistFailure(client, failure);
+  await client.query("commit");
+  return res.status(400).json({ ok: false, error: reason, request_id: requestId });
+}
 
     if (/\"secret\"\s*:|\"webhook_secret\"\s*:|\"webhooksecret\"\s*:|\"token\"\s*:|\"authorization\"\s*:/i.test(rawBodyRedacted)) {
       const failure = buildFailureRecord({
